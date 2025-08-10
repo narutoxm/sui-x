@@ -1,3 +1,4 @@
+
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
@@ -44,8 +45,7 @@ impl WriteApiServer for WriteApi {
         let sui_transaction_response = self
             .fullnode
             .execute_transaction_block(tx_bytes, signatures, options.clone(), request_type)
-            .await
-            .map_err(crate::errors::client_error_to_error_object)?;
+            .await?;
         Ok(SuiTransactionBlockResponseWithOptions {
             response: sui_transaction_response,
             options: options.unwrap_or_default(),
@@ -70,17 +70,13 @@ impl WriteApiServer for WriteApi {
                 additional_args,
             )
             .await
-            .map_err(crate::errors::client_error_to_error_object)
     }
 
     async fn dry_run_transaction_block(
         &self,
         tx_bytes: Base64,
     ) -> RpcResult<DryRunTransactionBlockResponse> {
-        self.fullnode
-            .dry_run_transaction_block(tx_bytes)
-            .await
-            .map_err(crate::errors::client_error_to_error_object)
+        self.fullnode.dry_run_transaction_block(tx_bytes).await
     }
 
     async fn dry_run_transaction_block_override(
@@ -92,7 +88,6 @@ impl WriteApiServer for WriteApi {
             .dry_run_transaction_block_override(tx_bytes, override_objects)
             .await
             .map_err(crate::errors::client_error_to_error_object)
-            
     }
 }
 

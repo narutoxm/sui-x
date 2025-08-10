@@ -64,7 +64,7 @@ pub struct AuthorityPerpetualTables {
     /// This is because there can be partially executed transactions whose effects have not yet
     /// been written out, and which must be retried. But, they cannot be retried unless their input
     /// objects are still accessible!
-    pub(crate) objects: DBMap<ObjectKey, StoreObjectWrapper>,
+    pub objects: DBMap<ObjectKey, StoreObjectWrapper>,
 
     /// This is a map between object references of currently active objects that can be mutated.
     ///
@@ -363,6 +363,13 @@ impl AuthorityPerpetualTables {
             None,
             None,
             MetricConf::new("perpetual_readonly"),
+        )
+    }
+
+    pub fn open_readonly_as_rw(parent_path: &Path) -> AuthorityPerpetualTables {
+        Self::get_rw_handle_readonly_inner(
+            Self::path(parent_path),
+            MetricConf::new("perpetual_readonly_as_rw"),
         )
     }
 

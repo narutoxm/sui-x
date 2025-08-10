@@ -2,15 +2,36 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::Arc;
 use sui_types::accumulator_event::AccumulatorEvent;
 use sui_types::base_types::{FullObjectID, ObjectRef};
+use sui_types::committee::EpochId;
 use sui_types::effects::{TransactionEffects, TransactionEffectsAPI, TransactionEvents};
 use sui_types::inner_temporary_store::{InnerTemporaryStore, WrittenObjects};
 use sui_types::storage::{FullObjectKey, InputKey, MarkerValue, ObjectKey};
-use sui_types::transaction::{TransactionDataAPI, VerifiedTransaction};
+use sui_types::message_envelope::{Envelope, VerifiedEnvelope};
+use sui_types::transaction::{Transaction, TransactionDataAPI, VerifiedTransaction};
 
+
+#[derive(Serialize, Deserialize)]
+pub struct SerializableTransactionOutputs {
+    transaction: Transaction,
+    effects: TransactionEffects,
+    events: TransactionEvents,
+
+    pub markers: Vec<(FullObjectKey, MarkerValue)>,
+    pub wrapped: Vec<ObjectKey>,
+    pub deleted: Vec<ObjectKey>,
+    pub locks_to_delete: Vec<ObjectRef>,
+    pub new_locks_to_init: Vec<ObjectRef>,
+    pub written: WrittenObjects,
+
+    // Temporarily needed to notify TxManager about the availability of objects.
+    // TODO: Remove this once we ship the new ExecutionScheduler.
+    pub output_keys: Vec<InputKey>,
+}
 /// TransactionOutputs
 #[derive(Debug)]
 pub struct TransactionOutputs {
@@ -216,6 +237,45 @@ impl TransactionOutputs {
             new_locks_to_init: vec![],
             written: WrittenObjects::new(),
             output_keys: vec![],
+        }
+    }
+
+    pub fn to_bytes(&self, epoch_id: EpochId) -> Vec<u8> {
+        // first convert to serializable
+        let serializable = SerializableTransactionOutputs {
+            transaction: Envelope::new_from_data_and_sig(
+                self.transaction.data().clone(),
+                self.transaction.auth_sig().clone(),
+            ),
+            effects: self.effects.clone(),
+            events: self.events.clone(),
+            markers: self.markers.clone(),
+            wrapped: self.wrapped.clone(),
+            deleted: self.deleted.clone(),
+            locks_to_delete: self.locks_to_delete.clone(),
+            new_locks_to_init: self.new_locks_to_init.clone(),
+            written: self.written.clone(),
+            output_keys: self.output_keys.clone(),
+        };
+        let to_serialize = (epoch_id, serializable);
+        bcs::to_bytes(&to_serialize).expect("Failed to serialize TransactionOutputs")
+    }
+
+    pub fn from_serializable(serializable: SerializableTransactionOutputs) -> Self {
+        let verified_transaction = VerifiedEnvelope::new_unchecked(serializable.transaction);
+
+        Self {
+            transaction: Arc::new(verified_transaction),
+            effects: serializable.effects,
+            events: serializable.events,
+            accumulator_events: Mutex::new(vec![]),
+            markers: serializable.markers,
+            wrapped: serializable.wrapped,
+            deleted: serializable.deleted,
+            locks_to_delete: serializable.locks_to_delete,
+            new_locks_to_init: serializable.new_locks_to_init,
+            written: serializable.written,
+            output_keys: serializable.output_keys,
         }
     }
 }

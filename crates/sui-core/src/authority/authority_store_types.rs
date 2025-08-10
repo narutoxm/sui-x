@@ -130,7 +130,7 @@ pub fn get_store_object(object: Object) -> StoreObjectWrapper {
     StoreObject::Value(store_object).into()
 }
 
-pub(crate) fn try_construct_object(
+pub fn try_construct_object(
     object_key: &ObjectKey,
     store_object: StoreObjectValue,
 ) -> Result<Object, SuiError> {

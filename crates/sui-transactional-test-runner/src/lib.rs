@@ -6,7 +6,7 @@
 pub mod args;
 pub mod offchain_state;
 pub mod programmable_transaction_test_parser;
-mod simulator_persisted_store;
+pub mod simulator_persisted_store;
 pub mod test_adapter;
 
 use move_command_line_common::testing::InstaOptions;

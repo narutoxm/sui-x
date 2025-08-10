@@ -217,6 +217,7 @@ pub trait ObjectCacheRead: Send + Sync {
                 None => {
                     let live_objref = self._get_live_objref(object_ref.0)?;
                     let error = if live_objref.1 >= object_ref.1 {
+                        tracing::error!("unavailable multi_get_objects_with_more_accurate_error_return {:?} {:?}", object_ref, live_objref);
                         UserInputError::ObjectVersionUnavailableForConsumption {
                             provided_obj_ref: *object_ref,
                             current_version: live_objref.1,
@@ -347,6 +348,18 @@ pub trait ObjectCacheRead: Send + Sync {
         object_id: FullObjectID,
         epoch_id: EpochId,
     ) -> Option<(SequenceNumber, MarkerValue)>;
+
+    /// If the shared object was deleted, return deletion info for the current live version
+    fn get_last_shared_object_deletion_info(
+        &self,
+        object_id: &ObjectID,
+        epoch_id: EpochId,
+    ) -> Option<(SequenceNumber, TransactionDigest)> {
+        match self.get_latest_marker(FullObjectID::Fastpath(*object_id), epoch_id) {
+            Some((version, MarkerValue::ConsensusStreamEnded(digest))) => Some((version, digest)),
+            _ => None,
+        }
+    }
 
     /// If the given consensus object stream was ended, return related
     /// version and transaction digest.
@@ -599,6 +612,14 @@ pub trait ExecutionCacheWrite: Send + Sync {
         tx_digest: TransactionDigest,
         signed_transaction: Option<VerifiedSignedTransaction>,
     ) -> SuiResult;
+
+    fn update_package_cache<'a>(
+        &'a self,
+        package_updates: &'a [(ObjectID, Object)],
+    ) -> BoxFuture<'a, SuiResult>;
+
+    fn reload_objects(&self, objects: Vec<(ObjectID, Object)>);
+    fn update_underlying(&self, clear_cache: bool);
 
     /// Write an object entry directly to the cache for testing.
     /// This allows us to write an object without constructing the entire

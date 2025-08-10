@@ -111,7 +111,7 @@ pub struct AuthorityStore {
     /// Internal vector of locks to manage concurrent writes to the database
     mutex_table: MutexTable<ObjectDigest>,
 
-    pub(crate) perpetual_tables: Arc<AuthorityPerpetualTables>,
+    pub perpetual_tables: Arc<AuthorityPerpetualTables>,
 
     pub(crate) root_state_notify_read:
         NotifyRead<EpochId, (CheckpointSequenceNumber, GlobalStateHash)>,

@@ -48,7 +48,7 @@ use std::sync::Arc;
 pub use write_store::WriteStore;
 
 /// A potential input to a transaction.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,)]
 pub enum InputKey {
     VersionedObject {
         id: FullObjectID,

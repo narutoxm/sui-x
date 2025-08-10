@@ -14,14 +14,16 @@ use itertools::Itertools;
 use object_store::path::Path;
 use object_store::{DynObjectStore, Error, ObjectStore};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::num::NonZeroUsize;
 use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
-use tokio::time::Instant;
-use tracing::{error, warn};
+use tokio::sync::Mutex;
+use tokio::time::{sleep, Instant};
+use tracing::{debug, error, info, warn};
 use url::Url;
 
 pub const MANIFEST_FILENAME: &str = "MANIFEST";
@@ -77,15 +79,230 @@ impl PerEpochManifest {
     }
 }
 
+/// 创建自定义的重试策略，返回每次重试的等待时间
+fn get_retry_delay(attempt: u32) -> Duration {
+    Duration::from_millis(INITIAL_RETRY_DELAY_MS)
+}
+
+#[derive(Debug)]
+pub struct DownloadStatus {
+    pub start_time: Instant,
+    pub bytes_downloaded: u64,
+    pub last_progress: Instant,
+    pub last_bytes: u64,
+}
+
+// 文件下载超时配置
+const FILE_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(300); // 5分钟超时
+const MIN_ACCEPTABLE_SPEED: u64 = 100 * 1024; // 100KB/s最低可接受速度
+const MAX_RETRY_ATTEMPTS: u32 = u32::MAX; // 最大重试次数
+const INITIAL_RETRY_DELAY_MS: u64 = 5000; // 初始重试延迟5秒
+const MAX_RETRY_DELAY_MS: u64 = 60000; // 最大重试延迟60秒
+
+pub fn format_size(size: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+
+    if size >= GB {
+        format!("{:.2} GB", size as f64 / GB as f64)
+    } else if size >= MB {
+        format!("{:.2} MB", size as f64 / MB as f64)
+    } else if size >= KB {
+        format!("{:.2} KB", size as f64 / KB as f64)
+    } else {
+        format!("{} B", size)
+    }
+}
+
 pub async fn get<S: ObjectStoreGetExt>(store: &S, src: &Path) -> Result<Bytes> {
-    let bytes = retry(backoff::ExponentialBackoff::default(), || async {
-        store.get_bytes(src).await.map_err(|e| {
-            error!("Failed to read file from object store with error: {:?}", &e);
-            backoff::Error::transient(e)
-        })
-    })
-    .await?;
-    Ok(bytes)
+    let mut attempt_counter = 0;
+
+    loop {
+        match store.get_bytes(src).await {
+            Ok(bytes) => {
+                // 成功获取数据
+                if attempt_counter > 0 {
+                    info!(
+                        "Successfully read file {} after {} retries",
+                        src, attempt_counter
+                    );
+                }
+                return Ok(bytes);
+            },
+            Err(e) => {
+                attempt_counter += 1;
+
+                if attempt_counter >= MAX_RETRY_ATTEMPTS {
+                    // 达到最大重试次数（实际上几乎不可能到达这个条件）
+                    return Err(anyhow::anyhow!(
+                        "Failed to read file {} after {} retries: {:?}",
+                        src, attempt_counter, e
+                    ));
+                }
+
+                // 获取当前重试的延迟
+                let retry_delay = get_retry_delay(attempt_counter);
+
+                error!(
+                    "Failed to read file {} (attempt {}/{}), will retry in {:?}: {:?}",
+                    src, attempt_counter, MAX_RETRY_ATTEMPTS, retry_delay, e
+                );
+
+                // 等待后重试
+                sleep(retry_delay).await;
+                // 继续循环尝试
+            }
+        }
+    }
+}
+
+pub async fn get_ext<S: ObjectStoreGetExt>(
+    store: &S,
+    src: &Path,
+    active_downloads: Arc<Mutex<HashMap<String, DownloadStatus>>>,
+    total_bytes: Arc<AtomicU64>,
+    file_name: String,
+) -> Result<Bytes> {
+    let file_path = src.to_string();
+    let mut attempt_counter = 0;
+
+    // 记录下载状态
+    {
+        let mut downloads = active_downloads.lock().await;
+        downloads.insert(file_path.clone(), DownloadStatus {
+            start_time: Instant::now(),
+            bytes_downloaded: 0,
+            last_progress: Instant::now(),
+            last_bytes: 0,
+        });
+    }
+
+    loop {
+        // 创建带超时的下载任务
+        let download_task = async {
+            match store.get_bytes(src).await {
+                Ok(bytes) => {
+                    // 更新下载状态和总字节计数
+                    let bytes_len = bytes.len() as u64;
+                    total_bytes.fetch_add(bytes_len, Ordering::Relaxed);
+
+                    // 更新活跃下载状态
+                    let mut downloads = active_downloads.lock().await;
+                    if let Some(status) = downloads.get_mut(&file_path) {
+                        status.bytes_downloaded += bytes_len;
+                    }
+
+                    Ok(bytes)
+                },
+                Err(e) => {
+                    Err(e)
+                }
+            }
+        };
+
+        match tokio::time::timeout(FILE_DOWNLOAD_TIMEOUT, download_task).await {
+            Ok(result) => match result {
+                Ok(bytes) => {
+                    // 成功下载，从活跃下载列表中移除
+                    active_downloads.lock().await.remove(&file_path);
+
+                    if attempt_counter > 0 {
+                        info!(
+                            "Successfully read file {} ({}KB) after {} retries",
+                            file_name, bytes.len() / 1024, attempt_counter
+                        );
+                    } else {
+                        info!(
+                            "Successfully downloaded file {} ({}KB)",
+                            file_name, bytes.len() / 1024
+                        );
+                    }
+
+                    return Ok(bytes);
+                },
+                Err(e) => {
+                    attempt_counter += 1;
+
+                    if attempt_counter >= MAX_RETRY_ATTEMPTS {
+                        active_downloads.lock().await.remove(&file_path);
+                        return Err(anyhow::anyhow!(
+                            "Failed to read file {} after {} retries: {:?}",
+                            file_name, attempt_counter, e
+                        ));
+                    }
+
+                    // 指数退避重试延迟
+                    let base_delay = INITIAL_RETRY_DELAY_MS * (1 << attempt_counter.min(6));
+                    let retry_delay_ms = base_delay.min(MAX_RETRY_DELAY_MS);
+                    let retry_delay = Duration::from_millis(retry_delay_ms);
+
+                    error!(
+                        "Failed to read file {} (attempt {}/{}), will retry in {:?}: {:?}",
+                        file_name, attempt_counter, MAX_RETRY_ATTEMPTS, retry_delay, e
+                    );
+
+                    sleep(retry_delay).await;
+                }
+            },
+            Err(_) => {
+                // 下载超时
+                attempt_counter += 1;
+
+                // 检查下载速度
+                let should_continue = {
+                    let mut downloads = active_downloads.lock().await;
+                    if let Some(status) = downloads.get_mut(&file_path) {
+                        let elapsed = status.last_progress.elapsed();
+                        let bytes_diff = status.bytes_downloaded - status.last_bytes;
+
+                        if bytes_diff > 0 && elapsed.as_secs() > 0 {
+                            let current_speed = bytes_diff / elapsed.as_secs();
+
+                            // 如果速度可接受，更新状态并继续
+                            if current_speed >= MIN_ACCEPTABLE_SPEED {
+                                info!(
+                                    "File {} download is slow but progressing ({}/s), continuing...",
+                                    file_name, format_size(current_speed)
+                                );
+
+                                status.last_progress = Instant::now();
+                                status.last_bytes = status.bytes_downloaded;
+                                true
+                            } else {
+                                false
+                            }
+                        } else {
+                            // 没有进度，应该重试
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                };
+
+                if should_continue {
+                    continue;
+                }
+
+                if attempt_counter >= MAX_RETRY_ATTEMPTS {
+                    active_downloads.lock().await.remove(&file_path);
+                    return Err(anyhow::anyhow!(
+                        "Download of file {} timed out after {} attempts",
+                        file_name, attempt_counter
+                    ));
+                }
+
+                error!(
+                    "Download timeout for file {} (attempt {}/{}), will retry",
+                    file_name, attempt_counter, MAX_RETRY_ATTEMPTS
+                );
+
+                // 短暂等待后重试
+                sleep(Duration::from_secs(1)).await;
+            }
+        }
+    }
 }
 
 pub async fn exists<S: ObjectStoreGetExt>(store: &S, src: &Path) -> bool {
@@ -93,19 +310,50 @@ pub async fn exists<S: ObjectStoreGetExt>(store: &S, src: &Path) -> bool {
 }
 
 pub async fn put<S: ObjectStorePutExt>(store: &S, src: &Path, bytes: Bytes) -> Result<()> {
-    retry(backoff::ExponentialBackoff::default(), || async {
-        if !bytes.is_empty() {
-            store.put_bytes(src, bytes.clone()).await.map_err(|e| {
-                error!("Failed to write file to object store with error: {:?}", &e);
-                backoff::Error::transient(e)
-            })
-        } else {
-            warn!("Not copying empty file: {:?}", src);
-            Ok(())
+    if bytes.is_empty() {
+        warn!("Not copying empty file: {:?}", src);
+        return Ok(());
+    }
+
+    let mut attempt_counter = 0;
+
+    loop {
+        match store.put_bytes(src, bytes.clone()).await {
+            Ok(_) => {
+                // 成功写入数据
+                if attempt_counter > 0 {
+                    info!(
+                        "Successfully wrote file {} after {} retries",
+                        src, attempt_counter
+                    );
+                }
+                return Ok(());
+            },
+            Err(e) => {
+                attempt_counter += 1;
+
+                if attempt_counter >= MAX_RETRY_ATTEMPTS {
+                    // 达到最大重试次数（几乎不可能）
+                    return Err(anyhow::anyhow!(
+                        "Failed to write file {} after {} retries: {:?}",
+                        src, attempt_counter, e
+                    ));
+                }
+
+                // 获取当前重试的延迟
+                let retry_delay = get_retry_delay(attempt_counter);
+
+                error!(
+                    "Failed to write file {} (attempt {}/{}), will retry in {:?}: {:?}",
+                    src, attempt_counter, MAX_RETRY_ATTEMPTS, retry_delay, e
+                );
+
+                // 等待后重试
+                sleep(retry_delay).await;
+                // 继续循环尝试
+            }
         }
-    })
-    .await?;
-    Ok(())
+    }
 }
 
 pub async fn copy_file<S: ObjectStoreGetExt, D: ObjectStorePutExt>(
@@ -120,6 +368,44 @@ pub async fn copy_file<S: ObjectStoreGetExt, D: ObjectStorePutExt>(
     } else {
         warn!("Not copying empty file: {:?}", src);
         Ok(())
+    }
+}
+
+pub async fn copy_file_ext<S: ObjectStoreGetExt, D: ObjectStorePutExt>(
+    src: &Path,
+    dest: &Path,
+    src_store: &S,
+    dest_store: &D,
+    active_downloads: Arc<Mutex<HashMap<String, DownloadStatus>>>,
+    total_bytes: Arc<AtomicU64>,
+) -> Result<()> {
+    let file_path = src.to_string();
+    let file_name = file_path.split('/').last().unwrap_or("unknown");
+
+    // 获取文件内容
+    let bytes = get_ext(
+        src_store,
+        src,
+        active_downloads.clone(),
+        total_bytes.clone(),
+        file_name.to_string(),
+    ).await?;
+
+    if bytes.is_empty() {
+        warn!("Not copying empty file: {:?}", src);
+        return Ok(());
+    }
+
+    // 写入目标存储
+    match dest_store.put_bytes(dest, bytes).await {
+        Ok(_) => {
+            debug!("Successfully wrote file: {}", file_path);
+            Ok(())
+        },
+        Err(e) => {
+            error!("Failed to write file to destination store: {}", e);
+            Err(anyhow::anyhow!("Failed to write file: {}", e))
+        }
     }
 }
 
