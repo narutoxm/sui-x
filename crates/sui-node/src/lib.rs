@@ -808,6 +808,7 @@ impl SuiNode {
 
         let metrics = Arc::new(JsonRpcMetrics::new(&prometheus_registry));
 
+        info!("SuiNode: About to start IPC server");
         let ipc_server = build_ipc_server(
             state.clone(),
             &transaction_orchestrator.clone(),
@@ -815,6 +816,7 @@ impl SuiNode {
             metrics.clone(),
         )
         .await?;
+        info!("SuiNode: IPC server initialization completed, result: {:?}", ipc_server.is_some());
 
         let (http_servers, subscription_service_checkpoint_sender) = build_http_servers(
             state.clone(),

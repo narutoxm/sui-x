@@ -41,9 +41,14 @@ impl IpcServer {
     }
 
     pub async fn run(&self) -> anyhow::Result<()> {
+        info!("IpcServer: Starting main accept loop");
         loop {
+            debug!("IpcServer: Waiting for new connection...");
             let conn = match self.listener.accept().await {
-                Ok(c) => c,
+                Ok(c) => {
+                    info!("IpcServer: Accepted new connection");
+                    c
+                },
                 Err(error) => {
                     error!(%error, "IpcServer error while accepting connection");
                     continue;
@@ -116,10 +121,12 @@ pub async fn build_ipc_server(
         TransactionExecutionApi::new(state, transaction_orchestrator.clone(), metrics);
     let api = Arc::new(tx_execution_api);
 
-    let server = IpcServer::new(IPC_PATH, api).await?;
+    info!("SuiNode: About to start IPC server");
+    let ipc_server = IpcServer::new(IPC_PATH, api).await?;
+    info!("SuiNode: IPC server initialization completed, result: {:?}", IPC_PATH);
 
     let handle = tokio::spawn(async move {
-        if let Err(error) = server.run().await {
+        if let Err(error) = ipc_server.run().await {
             error!(%error, "IpcServer error while running");
         }
     });
