@@ -87,7 +87,32 @@ async fn wait_for_checkpoint(
             }
 
             _ = tokio::time::sleep(warning_timeout) => {
+                // Extra diagnostics to help understand why scheduling is stalling.
+                let highest_synced = checkpoint_store
+                    .get_highest_synced_checkpoint_seq_number()
+                    .unwrap_or(None);
+                let highest_executed = checkpoint_store
+                    .get_highest_executed_checkpoint_seq_number()
+                    .unwrap_or(None);
+                let highest_verified = checkpoint_store
+                    .get_highest_verified_checkpoint()
+                    .ok()
+                    .flatten()
+                    .map(|c| *c.sequence_number());
+                let lowest_available = checkpoint_store
+                    .get_highest_pruned_checkpoint_seq_number()
+                    .ok()
+                    .flatten()
+                    .map(|p| p + 1)
+                    .unwrap_or(0);
+
                 warn!(
+                    next_to_schedule = seq,
+                    ?highest_synced,
+                    ?highest_verified,
+                    ?highest_executed,
+                    lowest_available = lowest_available,
+                    ?warning_timeout,
                     "Received no new synced checkpoints for {warning_timeout:?}. Next checkpoint to be scheduled: {seq}",
                 );
             }

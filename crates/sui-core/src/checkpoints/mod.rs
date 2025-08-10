@@ -709,7 +709,7 @@ impl CheckpointStore {
         checkpoint: &VerifiedCheckpoint,
     ) -> Result<(), TypedStoreError> {
         let seq = *checkpoint.sequence_number();
-        debug!(checkpoint_seq = seq, "Updating highest synced checkpoint",);
+        info!(checkpoint_seq = seq, "Updating highest synced checkpoint");
         self.tables.watermarks.insert(
             &CheckpointWatermark::HighestSynced,
             &(seq, *checkpoint.digest()),

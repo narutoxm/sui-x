@@ -1906,7 +1906,9 @@ impl AuthorityState {
             .write_transaction_outputs(epoch_store.epoch(), Arc::clone(&transaction_outputs));
 
         // if system tx, skip
+        debug!("MEV: Starting MEV check for transaction");
         if !certificate.transaction_data().is_system_tx() {
+            debug!("MEV: Transaction is not system tx, proceeding with MEV logic");
             let changed_objects: Vec<_> = transaction_outputs
                 .written
                 .iter()
@@ -1914,6 +1916,7 @@ impl AuthorityState {
                 .collect();
 
             // if no changed objects, skip
+            debug!("MEV: Found {} changed objects", changed_objects.len());
             if !changed_objects.is_empty() {
                 // our own object || pool related object
                 let need_notify = changed_objects.iter().any(|(id, obj)| {
@@ -1924,6 +1927,7 @@ impl AuthorityState {
                     //     .unwrap();
 
                     let is_pool_related = self.pool_related_ids.contains(id);
+                    debug!("MEV: Checking object {:?}, is_pool_related: {}", id, is_pool_related);
                     is_pool_related
                 });
 
@@ -1934,11 +1938,16 @@ impl AuthorityState {
                 //         .any(|swap_event| event_type.starts_with(swap_event))
                 // });
 
+                debug!("MEV: need_notify = {}", need_notify);
                 if need_notify {
+                    info!("MEV: Spawning cache update task for {} objects", changed_objects.len());
                     let cache_handler = self.cache_update_handler.clone();
                     let objects_clone = changed_objects.clone();
                     tokio::spawn(async move {
-                        cache_handler.notify_written(objects_clone).await
+                        debug!("MEV: Cache update task started");
+                        let start_time = std::time::Instant::now();
+                        cache_handler.notify_written(objects_clone).await;
+                        debug!("MEV: Cache update task completed in {:?}", start_time.elapsed());
                     });
                 }
             }

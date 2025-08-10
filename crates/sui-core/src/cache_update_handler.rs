@@ -10,7 +10,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Mutex;
 
-use tracing::{error, info};
+use tracing::{error, info, debug, warn};
 
 const SOCKET_PATH: &str = "/tmp/sui_cache_updates.sock";
 pub const POOL_RELATED_OBJECTS_PATH: &str = "/home/wyf/projects/sui-mev/pool_related_ids.txt";
@@ -32,7 +32,7 @@ pub fn pool_related_object_ids() -> DashSet<ObjectID> {
 
 #[derive(Debug, Clone)]
 pub struct CacheUpdateHandler {
-    socket_path: PathBuf,
+    socket_path: PathBuf,     
     connections: Arc<Mutex<Vec<UnixStream>>>,
     running: Arc<AtomicBool>,
 }
@@ -44,6 +44,7 @@ impl CacheUpdateHandler {
         let _ = std::fs::remove_file(&socket_path);
 
         let listener = UnixListener::bind(&socket_path).expect("Failed to bind Unix socket");
+        info!("CacheUpdateHandler: listening on socket {:?}", socket_path);
 
         let connections = Arc::new(Mutex::new(Vec::new()));
         let running = Arc::new(AtomicBool::new(true));
@@ -76,38 +77,43 @@ impl CacheUpdateHandler {
     }
 
     pub async fn notify_written(&self, objects: Vec<(ObjectID, Object)>) {
+        debug!("CacheUpdateHandler: notify_written called with {} objects", objects.len());
+        let start_time = std::time::Instant::now();
+
         let serialized = bcs::to_bytes(&objects).expect("serialization error");
         let len = serialized.len() as u32;
         let len_bytes = len.to_le_bytes();
 
+        debug!("CacheUpdateHandler: acquiring connections lock...");
         let mut connections = self.connections.lock().await;
+        debug!("CacheUpdateHandler: got connections lock, {} active connections", connections.len());
 
         // Iterate over connections and remove any that fail
         let mut i = 0;
         while i < connections.len() {
             let stream = &mut connections[i];
 
-            // Attempt to write to the stream
             let result = async {
                 if let Err(e) = stream.write_all(&len_bytes).await {
-                    error!("Error writing length prefix to client: {}", e);
+                    error!("CacheUpdateHandler: error writing length prefix: {}", e);
                     Err(e)
                 } else if let Err(e) = stream.write_all(&serialized).await {
-                    error!("Error writing to client: {}", e);
+                    error!("CacheUpdateHandler: error writing payload: {}", e);
                     Err(e)
                 } else {
                     Ok(())
                 }
-            }
-            .await;
+            }.await;
 
-            // Remove connection if there was an error
             if result.is_err() {
+                warn!("CacheUpdateHandler: removing a dead connection");
                 connections.remove(i);
             } else {
                 i += 1;
             }
         }
+
+        debug!("CacheUpdateHandler: notify_written completed in {:?}", start_time.elapsed());
     }
 }
 
