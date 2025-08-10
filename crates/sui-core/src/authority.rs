@@ -1906,9 +1906,7 @@ impl AuthorityState {
             .write_transaction_outputs(epoch_store.epoch(), Arc::clone(&transaction_outputs));
 
         // if system tx, skip
-        debug!("MEV: Starting MEV check for transaction");
         if !certificate.transaction_data().is_system_tx() {
-            debug!("MEV: Transaction is not system tx, proceeding with MEV logic");
             let changed_objects: Vec<_> = transaction_outputs
                 .written
                 .iter()
@@ -1916,38 +1914,21 @@ impl AuthorityState {
                 .collect();
 
             // if no changed objects, skip
-            debug!("MEV: Found {} changed objects", changed_objects.len());
             if !changed_objects.is_empty() {
                 // our own object || pool related object
-                let need_notify = changed_objects.iter().any(|(id, obj)| {
-                    // let is_our_object = obj.owner()
-                    //     == &ObjectID::from_str(
-                    //         &std::env::var("BRITISHBROADCASTCORPORATION").expect("BBC"),
-                    //     )
-                    //     .unwrap();
-
+                let need_notify = changed_objects.iter().any(|(id, _obj)| {
                     let is_pool_related = self.pool_related_ids.contains(id);
-                    debug!("MEV: Checking object {:?}, is_pool_related: {}", id, is_pool_related);
                     is_pool_related
                 });
 
-                // let has_swap_events = sui_events.iter().any(|event| {
-                //     let event_type = event.type_.to_string();
-                //     swap_events()
-                //         .iter()
-                //         .any(|swap_event| event_type.starts_with(swap_event))
-                // });
-
-                debug!("MEV: need_notify = {}", need_notify);
                 if need_notify {
-                    info!("MEV: Spawning cache update task for {} objects", changed_objects.len());
+                    info!("MEV: Spawning cache task for {} objects", changed_objects.len());
                     let cache_handler = self.cache_update_handler.clone();
                     let objects_clone = changed_objects.clone();
                     tokio::spawn(async move {
-                        debug!("MEV: Cache update task started");
                         let start_time = std::time::Instant::now();
                         cache_handler.notify_written(objects_clone).await;
-                        debug!("MEV: Cache update task completed in {:?}", start_time.elapsed());
+                        info!("MEV: Cache task completed in {:?}", start_time.elapsed());
                     });
                 }
             }
@@ -1966,12 +1947,15 @@ impl AuthorityState {
                 if !certificate.transaction_data().is_system_tx()
                 && !sui_events.is_empty()
                 && !transaction_outputs.written.is_empty() {
+                    info!("MEV: Spawning tx_effects task with {} events", sui_events.len());
                     let tx_handler = self.tx_handler.clone();
                     let effects_clone = effects.clone();
                     let events_clone = sui_events.clone();
 
                     tokio::spawn(async move {
-                        tx_handler.send_tx_effects_and_events(&effects_clone, events_clone).await
+                        let start_time = std::time::Instant::now();
+                        tx_handler.send_tx_effects_and_events(&effects_clone, events_clone).await;
+                        info!("MEV: tx_effects task completed in {:?}", start_time.elapsed());
                     });
                 }
 
