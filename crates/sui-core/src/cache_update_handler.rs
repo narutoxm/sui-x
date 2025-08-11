@@ -13,7 +13,7 @@ use tokio::sync::Mutex;
 use tracing::{error, info, debug, warn};
 
 const SOCKET_PATH: &str = "/tmp/sui_cache_updates.sock";
-pub const POOL_RELATED_OBJECTS_PATH: &str = "/home/wyf/projects/sui-mev/pool_related_ids.txt";
+pub const POOL_RELATED_OBJECTS_PATH: &str = "/home/kakaxi/config/pool_related_ids.txt";
 
 pub fn pool_related_object_ids() -> DashSet<ObjectID> {
     let content = std::fs::read_to_string(POOL_RELATED_OBJECTS_PATH)
