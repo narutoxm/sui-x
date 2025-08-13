@@ -2154,7 +2154,8 @@ impl AuthorityState {
         );
 
         let elapsed = prepare_certificate_start_time.elapsed().as_micros() as f64;
-        info!("elapsed={:.2}us", elapsed);
+        // Downgrade to debug to avoid spamming the logs on every transaction.
+        debug!(elapsed_us = elapsed);
         if elapsed > 0.0 {
             self.metrics.prepare_cert_gas_latency_ratio.observe(
                 transaction_outputs

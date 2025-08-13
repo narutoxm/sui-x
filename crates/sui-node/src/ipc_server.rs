@@ -22,7 +22,7 @@ use sui_json_rpc_api::JsonRpcMetrics;
 use tokio::time::{sleep, Duration};
 
 const REQUEST_MAX_SIZE: usize = 10 * 1024 * 1024;
-const IPC_PATH: &str = "/home/ubuntu/sui/sui-mainnet.ipc";
+const IPC_PATH: &str = "/home/ubuntu/kakaxi/sui-mainnet.ipc";
 
 pub struct IpcServer {
     listener: LocalSocketListener,
