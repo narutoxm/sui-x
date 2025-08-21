@@ -3931,13 +3931,10 @@ impl AuthorityState {
             chain_identifier,
             congestion_tracker: Arc::new(CongestionTracker::new()),
             traffic_controller,
-<<<<<<< HEAD
             cache_update_handler: CacheUpdateHandler::new(),
             tx_handler: TxHandler::default(),
             pool_related_ids: pool_related_object_ids(),
-=======
             fork_recovery_state,
->>>>>>> 00aaf80c3eec0469d9c08dc78f5f354dd0c12706
         });
 
         let state_clone = Arc::downgrade(&state);
