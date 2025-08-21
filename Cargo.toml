@@ -407,6 +407,7 @@ inquire = "0.6.0"
 insta = { version = "1.21.1", features = ["redactions", "yaml", "json"] }
 insta-cmd = "0.6.0"
 integer-encoding = "3.0.1"
+interprocess = "2.2.3"
 ipnetwork = "0.20.0"
 iso8601 = "0.6.3"
 itertools = "0.13.0"
