@@ -19,7 +19,7 @@ use tracing::{info, warn};
 
 /// The minimum and maximum protocol versions supported by this build.
 const MIN_PROTOCOL_VERSION: u64 = 1;
-const MAX_PROTOCOL_VERSION: u64 = 90;
+const MAX_PROTOCOL_VERSION: u64 = 94;
 
 // Record history of protocol version allocations here:
 //
@@ -254,6 +254,10 @@ const MAX_PROTOCOL_VERSION: u64 = 90;
 // Version 90: Standard library improvements.
 //             Enable `debug_fatal` on Move invariant violations.
 //             Enable passkey and passkey inside multisig for mainnet.
+// Version 91: Minor changes in Sui Framework. Include CheckpointDigest in consensus dedup key for checkpoint signatures (V2).
+// Version 92: Disable checking shared object transfer restrictions per command = false
+// Version 93: Enable CheckpointDigest in consensus dedup key for checkpoint signatures.
+// Version 94: Decrease stored observations limit by 10% to stay within system object size limit.
 
 #[derive(Copy, Clone, Debug, Hash, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ProtocolVersion(u64);
@@ -450,6 +454,10 @@ struct FeatureFlags {
     // Enable receiving sent objects
     #[serde(skip_serializing_if = "is_false")]
     receive_objects: bool,
+
+    // If true, include CheckpointDigest in consensus dedup key for checkpoint signatures (V2).
+    #[serde(skip_serializing_if = "is_false")]
+    consensus_checkpoint_signature_key_includes_digest: bool,
 
     // Enable random beacon protocol
     #[serde(skip_serializing_if = "is_false")]
@@ -768,6 +776,10 @@ struct FeatureFlags {
     // Check for `init` for new modules to a package on upgrade.
     #[serde(skip_serializing_if = "is_false")]
     check_for_init_during_upgrade: bool,
+
+    // Check shared object transfer restrictions per command.
+    #[serde(skip_serializing_if = "is_false")]
+    per_command_shared_object_transfer_rules: bool,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -1104,20 +1116,20 @@ pub struct ProtocolConfig {
     // === Object runtime internal operation limits ====
     // These affect dynamic fields
     /// Maximum number of cached objects in the object runtime ObjectStore. Enforced by object runtime during execution
-    pub object_runtime_max_num_cached_objects: Option<u64>,
+    object_runtime_max_num_cached_objects: Option<u64>,
 
     /// Maximum number of cached objects in the object runtime ObjectStore in system transaction. Enforced by object runtime during execution
-    pub object_runtime_max_num_cached_objects_system_tx: Option<u64>,
+    object_runtime_max_num_cached_objects_system_tx: Option<u64>,
 
     /// Maximum number of stored objects accessed by object runtime ObjectStore. Enforced by object runtime during execution
-    pub object_runtime_max_num_store_entries: Option<u64>,
+    object_runtime_max_num_store_entries: Option<u64>,
 
     /// Maximum number of stored objects accessed by object runtime ObjectStore in system transaction. Enforced by object runtime during execution
-    pub object_runtime_max_num_store_entries_system_tx: Option<u64>,
+    object_runtime_max_num_store_entries_system_tx: Option<u64>,
 
     // === Execution gas costs ====
     /// Base cost for any Sui transaction
-    pub base_tx_cost_fixed: Option<u64>,
+    base_tx_cost_fixed: Option<u64>,
 
     /// Additional cost for a transaction that publishes a package
     /// i.e., the base cost of such a transaction is base_tx_cost_fixed + package_publish_cost_fixed
@@ -2161,6 +2173,15 @@ impl ProtocolConfig {
 
     pub fn check_for_init_during_upgrade(&self) -> bool {
         self.feature_flags.check_for_init_during_upgrade
+    }
+
+    pub fn per_command_shared_object_transfer_rules(&self) -> bool {
+        self.feature_flags.per_command_shared_object_transfer_rules
+    }
+
+    pub fn consensus_checkpoint_signature_key_includes_digest(&self) -> bool {
+        self.feature_flags
+            .consensus_checkpoint_signature_key_includes_digest
     }
 }
 
@@ -3871,7 +3892,7 @@ impl ProtocolConfig {
                     cfg.feature_flags
                         .ignore_execution_time_observations_after_certs_closed = true;
 
-                    // Disable backwards compatible behavior in exeuction time estimator for
+                    // Disable backwards compatible behavior in execution time estimator for
                     // new protocol version.
                     cfg.feature_flags.per_object_congestion_control_mode =
                         PerObjectCongestionControlMode::ExecutionTimeEstimate(
@@ -3905,6 +3926,32 @@ impl ProtocolConfig {
                         cfg.feature_flags.mysticeti_fastpath = true;
                     }
                 }
+                91 => {
+                    cfg.feature_flags.per_command_shared_object_transfer_rules = true;
+                }
+                92 => {
+                    cfg.feature_flags.per_command_shared_object_transfer_rules = false;
+                }
+                93 => {
+                    cfg.feature_flags
+                        .consensus_checkpoint_signature_key_includes_digest = true;
+                }
+                94 => {
+                    // Decrease stored observations limit 20->18 to stay within system object size limit.
+                    cfg.feature_flags.per_object_congestion_control_mode =
+                        PerObjectCongestionControlMode::ExecutionTimeEstimate(
+                            ExecutionTimeEstimateParams {
+                                target_utilization: 50,
+                                allowed_txn_cost_overage_burst_limit_us: 500_000, // 500 ms
+                                randomness_scalar: 20,
+                                max_estimate_us: 1_500_000, // 1.5s
+                                stored_observations_num_included_checkpoints: 10,
+                                stored_observations_limit: 18,
+                                stake_weighted_median_threshold: 3334,
+                                default_none_duration_for_new_keys: true,
+                            },
+                        );
+                }
                 // Use this template when making changes:
                 //
                 //     // modify an existing constant.
@@ -3921,7 +3968,13 @@ impl ProtocolConfig {
 
         // Simtest specific overrides.
         if cfg!(msim) {
+            // Trigger GC more often.
             cfg.consensus_gc_depth = Some(5);
+
+            // Trigger checkpoint splitting more often.
+            // cfg.max_transactions_per_checkpoint = Some(10);
+            // FIXME: Re-introduce this once we resolve the checkpoint splitting issue
+            // in the quarantine output.
         }
 
         cfg
@@ -3959,7 +4012,7 @@ impl ProtocolConfig {
             max_back_edges_per_function,
             max_back_edges_per_module,
             max_basic_blocks_in_script: None,
-            max_idenfitier_len: self.max_move_identifier_len_as_option(), // Before protocol version 9, there was no limit
+            max_identifier_len: self.max_move_identifier_len_as_option(), // Before protocol version 9, there was no limit
             disallow_self_identifier: self.feature_flags.disallow_self_identifier,
             allow_receiving_object_id: self.allow_receiving_object_id(),
             reject_mutable_random_on_entry_functions: self
@@ -4063,6 +4116,10 @@ impl ProtocolConfig {
 
     pub fn set_passkey_auth_for_testing(&mut self, val: bool) {
         self.feature_flags.passkey_auth = val
+    }
+
+    pub fn set_enable_party_transfer_for_testing(&mut self, val: bool) {
+        self.feature_flags.enable_party_transfer = val
     }
 
     pub fn set_consensus_distributed_vote_scoring_strategy_for_testing(&mut self, val: bool) {

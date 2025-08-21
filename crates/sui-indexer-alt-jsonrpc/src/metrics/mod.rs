@@ -30,6 +30,7 @@ pub struct RpcMetrics {
     pub requests_received: IntCounterVec,
     pub requests_succeeded: IntCounterVec,
     pub requests_failed: IntCounterVec,
+    pub requests_cancelled: IntCounterVec,
 
     pub owned_objects_filter_scans: Histogram,
     pub read_retries: IntCounterVec,
@@ -40,7 +41,7 @@ impl RpcMetrics {
     pub(crate) fn new(registry: &Registry) -> Arc<Self> {
         Arc::new(Self {
             request_latency: register_histogram_vec_with_registry!(
-                "rpc_request_latency",
+                "jsonrpc_request_latency",
                 "Time taken to respond to JSON-RPC requests, by method",
                 &["method"],
                 LATENCY_SEC_BUCKETS.to_vec(),
@@ -49,7 +50,7 @@ impl RpcMetrics {
             .unwrap(),
 
             requests_received: register_int_counter_vec_with_registry!(
-                "rpc_requests_received",
+                "jsonrpc_requests_received",
                 "Number of requests initiated for each JSON-RPC method",
                 &["method"],
                 registry
@@ -57,7 +58,7 @@ impl RpcMetrics {
             .unwrap(),
 
             requests_succeeded: register_int_counter_vec_with_registry!(
-                "rpc_requests_succeeded",
+                "jsonrpc_requests_succeeded",
                 "Number of requests that completed successfully for each JSON-RPC method",
                 &["method"],
                 registry
@@ -65,15 +66,23 @@ impl RpcMetrics {
             .unwrap(),
 
             requests_failed: register_int_counter_vec_with_registry!(
-                "rpc_requests_failed",
+                "jsonrpc_requests_failed",
                 "Number of requests that completed with an error for each JSON-RPC method, by error code",
                 &["method", "code"],
                 registry
             )
             .unwrap(),
 
+            requests_cancelled: register_int_counter_vec_with_registry!(
+                "jsonrpc_requests_cancelled",
+                "Number of requests that were cancelled before completion for each JSON-RPC method",
+                &["method"],
+                registry
+            )
+            .unwrap(),
+
             owned_objects_filter_scans: register_histogram_with_registry!(
-                "owned_objects_filter_scans",
+                "jsonrpc_owned_objects_filter_scans",
                 "Number of pages of owned objects scanned in response to compound owned object filters",
                 PAGE_SCAN_BUCKETS.to_vec(),
                 registry,

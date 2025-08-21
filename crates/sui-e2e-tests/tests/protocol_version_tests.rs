@@ -73,7 +73,7 @@ mod sim_only_tests {
     use sui_move_build::{BuildConfig, CompiledPackage};
     use sui_protocol_config::Chain;
     use sui_types::base_types::ConciseableName;
-    use sui_types::base_types::{ObjectID, ObjectRef};
+    use sui_types::base_types::{FullObjectID, FullObjectRef, ObjectID, ObjectRef};
     use sui_types::effects::{TransactionEffects, TransactionEffectsAPI};
     use sui_types::id::ID;
     use sui_types::object::Owner;
@@ -361,9 +361,9 @@ mod sim_only_tests {
         assert!(has_public_transfer(&cluster, &to_transfer1.0).await);
         // Instances of the type that existed before and new instances are able to take advantage of
         // the newly introduced ability
-        wrap_obj(&cluster, to_wrap0).await;
+        wrap_obj(&cluster, to_wrap0.as_object_ref()).await;
         transfer_obj(&cluster, SuiAddress::ZERO, to_transfer0).await;
-        wrap_obj(&cluster, to_wrap1).await;
+        wrap_obj(&cluster, to_wrap1.as_object_ref()).await;
         transfer_obj(&cluster, SuiAddress::ZERO, to_transfer1).await;
     }
 
@@ -503,7 +503,7 @@ mod sim_only_tests {
         .await
     }
 
-    async fn create_obj(cluster: &TestCluster) -> ObjectRef {
+    async fn create_obj(cluster: &TestCluster) -> FullObjectRef {
         execute_creating(cluster, {
             let mut builder = ProgrammableTransactionBuilder::new();
             builder
@@ -523,7 +523,7 @@ mod sim_only_tests {
         .clone()
     }
 
-    async fn wrap_obj(cluster: &TestCluster, obj: ObjectRef) -> ObjectRef {
+    async fn wrap_obj(cluster: &TestCluster, obj: ObjectRef) -> FullObjectRef {
         execute_creating(cluster, {
             let mut builder = ProgrammableTransactionBuilder::new();
             builder
@@ -546,7 +546,7 @@ mod sim_only_tests {
     async fn transfer_obj(
         cluster: &TestCluster,
         recipient: SuiAddress,
-        obj: ObjectRef,
+        obj: FullObjectRef,
     ) -> ObjectRef {
         execute(cluster, {
             let mut builder = ProgrammableTransactionBuilder::new();
@@ -556,7 +556,7 @@ mod sim_only_tests {
         .await
         .mutated()
         .iter()
-        .find(|oref| oref.reference.object_id == obj.0)
+        .find(|oref| oref.reference.object_id == obj.0.id())
         .unwrap()
         .reference
         .to_object_ref()
@@ -593,12 +593,17 @@ mod sim_only_tests {
     async fn execute_creating(
         cluster: &TestCluster,
         ptb: ProgrammableTransaction,
-    ) -> Vec<ObjectRef> {
+    ) -> Vec<FullObjectRef> {
         execute(cluster, ptb)
             .await
             .created()
             .iter()
-            .map(|oref| oref.reference.to_object_ref())
+            .map(|oref| {
+                FullObjectRef::from_object_ref_and_owner(
+                    oref.reference.to_object_ref(),
+                    &oref.owner,
+                )
+            })
             .collect()
     }
 
@@ -610,13 +615,15 @@ mod sim_only_tests {
         let (sender, gas_object) = context.get_one_gas_object().await.unwrap().unwrap();
 
         let rgp = context.get_reference_gas_price().await.unwrap();
-        let txn = context.sign_transaction(&TransactionData::new_programmable(
-            sender,
-            vec![gas_object],
-            ptb,
-            rgp * TEST_ONLY_GAS_UNIT_FOR_GENERIC,
-            rgp,
-        ));
+        let txn = context
+            .sign_transaction(&TransactionData::new_programmable(
+                sender,
+                vec![gas_object],
+                ptb,
+                rgp * TEST_ONLY_GAS_UNIT_FOR_GENERIC,
+                rgp,
+            ))
+            .await;
 
         context
             .execute_transaction_must_succeed(txn)
@@ -682,8 +689,8 @@ mod sim_only_tests {
             .await
     }
 
-    async fn has_public_transfer(cluster: &TestCluster, object_id: &ObjectID) -> bool {
-        get_object(&cluster, object_id)
+    async fn has_public_transfer(cluster: &TestCluster, object_id: &FullObjectID) -> bool {
+        get_object(&cluster, &object_id.id())
             .await
             .data
             .try_as_move()

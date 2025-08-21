@@ -93,6 +93,7 @@ use super::shared_object_congestion_tracker::{
 };
 use super::shared_object_version_manager::AssignedVersions;
 use super::transaction_deferral::{transaction_deferral_within_limit, DeferralKey, DeferralReason};
+use super::transaction_reject_reason_cache::TransactionRejectReasonCache;
 use crate::authority::epoch_start_configuration::EpochStartConfiguration;
 use crate::authority::execution_time_estimator::EXTRA_FIELD_EXECUTION_TIME_ESTIMATES_KEY;
 use crate::authority::shared_object_version_manager::{
@@ -102,7 +103,7 @@ use crate::authority::AuthorityMetrics;
 use crate::authority::ResolverWrapper;
 use crate::checkpoints::{
     BuilderCheckpointSummary, CheckpointHeight, CheckpointServiceNotify, EpochStats,
-    PendingCheckpointInfo, PendingCheckpointV2, PendingCheckpointV2Contents,
+    PendingCheckpoint, PendingCheckpointInfo,
 };
 use crate::consensus_handler::{
     ConsensusCommitInfo, IndirectStateObserver, SequencedConsensusTransaction,
@@ -419,6 +420,9 @@ pub struct AuthorityPerEpochStore {
     end_of_epoch_execution_time_observations: OnceCell<StoredExecutionTimeObservations>,
 
     pub(crate) consensus_tx_status_cache: Option<ConsensusTxStatusCache>,
+
+    /// A cache that maintains the reject vote reason for a transaction.
+    pub(crate) tx_reject_reason_cache: Option<TransactionRejectReasonCache>,
 
     /// Waiters for settlement transactions. Used by execution scheduler to wait for
     /// settlement transaction keys to resolve to transactions.
@@ -1114,7 +1118,13 @@ impl AuthorityPerEpochStore {
             };
 
         let consensus_tx_status_cache = if protocol_config.mysticeti_fastpath() {
-            Some(ConsensusTxStatusCache::new())
+            Some(ConsensusTxStatusCache::new(protocol_config.gc_depth()))
+        } else {
+            None
+        };
+
+        let tx_reject_reason_cache = if protocol_config.mysticeti_fastpath() {
+            Some(TransactionRejectReasonCache::new(None, epoch_id))
         } else {
             None
         };
@@ -1159,6 +1169,7 @@ impl AuthorityPerEpochStore {
             tx_object_debts: OnceCell::new(),
             end_of_epoch_execution_time_observations: OnceCell::new(),
             consensus_tx_status_cache,
+            tx_reject_reason_cache,
             settlement_registrations: Default::default(),
         });
 
@@ -1416,6 +1427,67 @@ impl AuthorityPerEpochStore {
             .running_root_state_hash
             .insert(checkpoint, hash)?;
         self.running_root_notify_read.notify(checkpoint, hash);
+
+        Ok(())
+    }
+
+    pub fn clear_state_hashes_after_checkpoint(
+        &self,
+        last_committed_checkpoint: CheckpointSequenceNumber,
+    ) -> SuiResult {
+        let tables = self.tables()?;
+
+        let mut keys_to_remove = Vec::new();
+        for kv in tables
+            .running_root_state_hash
+            .safe_iter_with_bounds(Some(last_committed_checkpoint + 1), None)
+        {
+            let (checkpoint_seq, _) = kv?;
+            if checkpoint_seq > last_committed_checkpoint {
+                keys_to_remove.push(checkpoint_seq);
+            }
+        }
+
+        let mut checkpoint_keys_to_remove = Vec::new();
+        for kv in tables
+            .state_hash_by_checkpoint
+            .safe_iter_with_bounds(Some(last_committed_checkpoint + 1), None)
+        {
+            let (checkpoint_seq, _) = kv?;
+            if checkpoint_seq > last_committed_checkpoint {
+                checkpoint_keys_to_remove.push(checkpoint_seq);
+            }
+        }
+
+        if !keys_to_remove.is_empty() || !checkpoint_keys_to_remove.is_empty() {
+            let mut batch = self.db_batch()?;
+            if !keys_to_remove.is_empty() {
+                batch
+                    .delete_batch(&tables.running_root_state_hash, keys_to_remove.clone())
+                    .expect("db error");
+            }
+            if !checkpoint_keys_to_remove.is_empty() {
+                batch
+                    .delete_batch(
+                        &tables.state_hash_by_checkpoint,
+                        checkpoint_keys_to_remove.clone(),
+                    )
+                    .expect("db error");
+            }
+            batch.write().expect("db error");
+            for key in keys_to_remove {
+                info!(
+                    "Cleared running root state hash for checkpoint {} (after last committed checkpoint {})",
+                    key, last_committed_checkpoint
+                );
+            }
+            for key in checkpoint_keys_to_remove {
+                info!(
+                    "Cleared checkpoint state hash for checkpoint {} (after last committed checkpoint {})",
+                    key, last_committed_checkpoint
+                );
+            }
+        }
 
         Ok(())
     }
@@ -2338,17 +2410,23 @@ impl AuthorityPerEpochStore {
         transactions: &[ConsensusTransaction],
         lock: Option<&RwLockReadGuard<ReconfigState>>,
     ) -> SuiResult {
-        let key_value_pairs = transactions.iter().map(|tx| (tx.key(), tx));
+        let key_value_pairs = transactions.iter().filter_map(|tx| {
+            if tx.is_user_transaction() {
+                // UserTransaction does not need to be resubmitted on recovery.
+                None
+            } else {
+                debug!("Inserting pending consensus transaction: {:?}", tx.key());
+                Some((tx.key(), tx))
+            }
+        });
         self.tables()?
             .pending_consensus_transactions
             .multi_insert(key_value_pairs)?;
 
-        // UserTransaction exists only when mysticeti_fastpath is enabled in protocol config.
         let digests: Vec<_> = transactions
             .iter()
             .filter_map(|tx| match &tx.kind {
                 ConsensusTransactionKind::CertifiedTransaction(cert) => Some(cert.digest()),
-                ConsensusTransactionKind::UserTransaction(txn) => Some(txn.digest()),
                 _ => None,
             })
             .collect();
@@ -2370,6 +2448,7 @@ impl AuthorityPerEpochStore {
         &self,
         keys: &[ConsensusTransactionKey],
     ) -> SuiResult {
+        debug!("Removing pending consensus transactions: {:?}", keys);
         self.tables()?
             .pending_consensus_transactions
             .multi_remove(keys)?;
@@ -2512,7 +2591,7 @@ impl AuthorityPerEpochStore {
         Ok(())
     }
 
-    pub fn has_sent_end_of_publish(&self, authority: &AuthorityName) -> SuiResult<bool> {
+    pub fn has_received_end_of_publish_from(&self, authority: &AuthorityName) -> SuiResult<bool> {
         Ok(self
             .end_of_publish
             .try_lock()
@@ -2833,7 +2912,7 @@ impl AuthorityPerEpochStore {
     fn process_user_signatures<'a>(&self, certificates: impl Iterator<Item = &'a Schedulable>) {
         let sigs: Vec<_> = certificates
             .filter_map(|s| match s {
-                Schedulable::Transaction(certificate) | Schedulable::Withdraw(certificate, _) => {
+                Schedulable::Transaction(certificate) => {
                     Some((*certificate.digest(), certificate.tx_signatures().to_vec()))
                 }
                 Schedulable::RandomnessStateUpdate(_, _) => None,
@@ -2967,7 +3046,9 @@ impl AuthorityPerEpochStore {
                 ..
             }) => {}
             SequencedConsensusTransactionKind::External(ConsensusTransaction {
-                kind: ConsensusTransactionKind::CheckpointSignature(data),
+                kind:
+                    ConsensusTransactionKind::CheckpointSignature(data)
+                    | ConsensusTransactionKind::CheckpointSignatureV2(data),
                 ..
             }) => {
                 if transaction.sender_authority() != data.summary.auth_sig().authority {
@@ -3099,7 +3180,7 @@ impl AuthorityPerEpochStore {
         checkpoint_service: &Arc<C>,
         cache_reader: &dyn ObjectCacheRead,
         consensus_commit_info: &ConsensusCommitInfo,
-        indirect_state_observer: IndirectStateObserver,
+        mut indirect_state_observer: IndirectStateObserver,
         authority_metrics: &Arc<AuthorityMetrics>,
     ) -> SuiResult<(Vec<Schedulable>, AssignedTxAndVersions)> {
         // Split transactions into different types for processing.
@@ -3344,23 +3425,18 @@ impl AuthorityPerEpochStore {
             .collect();
 
         let (
-            verified_non_randomness_transactions,
-            verified_randomness_transactions,
+            mut verified_non_randomness_transactions,
+            mut verified_randomness_transactions,
             notifications,
-            lock,
-            final_round,
-            consensus_commit_prologue_root,
-            assigned_versions,
+            cancelled_txns,
         ) = self
             .process_consensus_transactions(
                 &mut output,
                 &sequenced_non_randomness_transactions,
                 &sequenced_randomness_transactions,
-                &end_of_publish_transactions,
                 checkpoint_service,
-                cache_reader,
                 consensus_commit_info,
-                indirect_state_observer,
+                &mut indirect_state_observer,
                 &mut roots,
                 &mut randomness_roots,
                 shared_object_congestion_tracker,
@@ -3373,6 +3449,51 @@ impl AuthorityPerEpochStore {
                 authority_metrics,
             )
             .await?;
+
+        if self.accumulators_enabled() {
+            // We insert settlement transactions to the end of the certificate queues.
+            // This is important for shared object version assignment to work correctly.
+            // Withdraw transactions will be using the accumulator version prior to the settlement,
+            // and settlements will bump the accumulator version at the end to reflect all
+            // balance changes during the commit.
+            let checkpoint_height =
+                self.calculate_pending_checkpoint_height(consensus_commit_info.round);
+
+            let non_random_settlement =
+                Schedulable::AccumulatorSettlement(self.epoch(), checkpoint_height);
+            roots.insert(non_random_settlement.key());
+            verified_non_randomness_transactions.push_back(non_random_settlement);
+
+            if randomness_round.is_some() {
+                let randomness_settlement =
+                    Schedulable::AccumulatorSettlement(self.epoch(), checkpoint_height + 1);
+                randomness_roots.insert(randomness_settlement.key());
+                verified_randomness_transactions.push_back(randomness_settlement);
+            }
+        }
+
+        // Add the consensus commit prologue transaction to the beginning of `verified_non_randomness_certificates`.
+        let consensus_commit_prologue_root = self.add_consensus_commit_prologue_transaction(
+            &mut output,
+            &mut verified_non_randomness_transactions,
+            consensus_commit_info,
+            indirect_state_observer,
+            &cancelled_txns,
+        )?;
+
+        let assigned_versions = self.process_consensus_transaction_shared_object_versions(
+            cache_reader,
+            verified_non_randomness_transactions.iter(),
+            verified_randomness_transactions.iter(),
+            &cancelled_txns,
+            &mut output,
+        )?;
+
+        let (lock, final_round) = self.process_end_of_publish_transactions_and_reconfig(
+            &mut output,
+            &end_of_publish_transactions,
+        )?;
+
         self.process_user_signatures(
             verified_non_randomness_transactions
                 .iter()
@@ -3439,25 +3560,25 @@ impl AuthorityPerEpochStore {
             let should_write_random_checkpoint =
                 randomness_round.is_some() || (dkg_failed && !randomness_roots.is_empty());
 
-            let pending_checkpoint = PendingCheckpointV2::V2(PendingCheckpointV2Contents {
+            let pending_checkpoint = PendingCheckpoint {
                 roots: non_randomness_roots,
                 details: PendingCheckpointInfo {
                     timestamp_ms: consensus_commit_info.timestamp,
                     last_of_epoch: final_round && !should_write_random_checkpoint,
                     checkpoint_height,
                 },
-            });
+            };
             self.write_pending_checkpoint(&mut output, &pending_checkpoint)?;
 
             if should_write_random_checkpoint {
-                let pending_checkpoint = PendingCheckpointV2::V2(PendingCheckpointV2Contents {
+                let pending_checkpoint = PendingCheckpoint {
                     roots: randomness_roots.into_iter().collect(),
                     details: PendingCheckpointInfo {
                         timestamp_ms: consensus_commit_info.timestamp,
                         last_of_epoch: final_round,
                         checkpoint_height: checkpoint_height + 1,
                     },
-                });
+                };
                 self.write_pending_checkpoint(&mut output, &pending_checkpoint)?;
             }
         }
@@ -3507,11 +3628,10 @@ impl AuthorityPerEpochStore {
             self.record_end_of_message_quorum_time_metric();
         }
 
-        let all_txns = [
-            verified_non_randomness_transactions,
-            verified_randomness_transactions,
-        ]
-        .concat();
+        let all_txns = verified_non_randomness_transactions
+            .into_iter()
+            .chain(verified_randomness_transactions.into_iter())
+            .collect();
 
         Ok((all_txns, assigned_versions))
     }
@@ -3555,7 +3675,10 @@ impl AuthorityPerEpochStore {
                         &mut shared_input_next_version,
                         cancelled_txns,
                     );
-                    version_assignment.push((*key.unwrap_digest(), assigned_versions));
+                    version_assignment.push((
+                        *key.unwrap_digest(),
+                        assigned_versions.shared_object_versions,
+                    ));
                 }
                 None => {}
             }
@@ -3596,17 +3719,15 @@ impl AuthorityPerEpochStore {
     // Assigns shared object versions to transactions and updates the next shared object version state.
     // Shared object versions in cancelled transactions are assigned to special versions that will
     // cause the transactions to be cancelled in execution engine.
-    fn process_consensus_transaction_shared_object_versions(
-        &self,
+    fn process_consensus_transaction_shared_object_versions<'a>(
+        &'a self,
         cache_reader: &dyn ObjectCacheRead,
-        non_randomness_transactions: &[Schedulable],
-        randomness_transactions: &[Schedulable],
+        non_randomness_transactions: impl Iterator<Item = &'a Schedulable> + Clone,
+        randomness_transactions: impl Iterator<Item = &'a Schedulable> + Clone,
         cancelled_txns: &BTreeMap<TransactionDigest, CancelConsensusCertificateReason>,
         output: &mut ConsensusCommitOutput,
     ) -> SuiResult<AssignedTxAndVersions> {
-        let all_certs = non_randomness_transactions
-            .iter()
-            .chain(randomness_transactions.iter());
+        let all_certs = non_randomness_transactions.chain(randomness_transactions);
 
         let ConsensusSharedObjVerAssignment {
             shared_input_next_versions,
@@ -3617,6 +3738,10 @@ impl AuthorityPerEpochStore {
             all_certs,
             cancelled_txns,
         )?;
+        debug!(
+            "Assigned versions from consensus processing: {:?}",
+            assigned_versions
+        );
 
         output.set_next_shared_object_versions(shared_input_next_versions);
         Ok(assigned_versions)
@@ -3675,8 +3800,8 @@ impl AuthorityPerEpochStore {
             .collect();
         let assigned_versions = self.process_consensus_transaction_shared_object_versions(
             cache_reader,
-            &transactions,
-            &[],
+            transactions.iter(),
+            std::iter::empty(),
             &BTreeMap::new(),
             &mut output,
         )?;
@@ -3707,16 +3832,14 @@ impl AuthorityPerEpochStore {
     /// - Or update the state for checkpoint or epoch change protocol.
     #[instrument(level = "debug", skip_all)]
     #[allow(clippy::type_complexity)]
-    pub(crate) async fn process_consensus_transactions<C: CheckpointServiceNotify>(
+    async fn process_consensus_transactions<C: CheckpointServiceNotify>(
         &self,
         output: &mut ConsensusCommitOutput,
         non_randomness_transactions: &[VerifiedSequencedConsensusTransaction],
         randomness_transactions: &[VerifiedSequencedConsensusTransaction],
-        end_of_publish_transactions: &[VerifiedSequencedConsensusTransaction],
         checkpoint_service: &Arc<C>,
-        cache_reader: &dyn ObjectCacheRead,
         consensus_commit_info: &ConsensusCommitInfo,
-        mut indirect_state_observer: IndirectStateObserver,
+        indirect_state_observer: &mut IndirectStateObserver,
         non_randomness_roots: &mut BTreeSet<TransactionKey>,
         randomness_roots: &mut BTreeSet<TransactionKey>,
         mut shared_object_congestion_tracker: SharedObjectCongestionTracker,
@@ -3728,13 +3851,10 @@ impl AuthorityPerEpochStore {
         execution_time_estimator: Option<&ExecutionTimeEstimator>,
         authority_metrics: &Arc<AuthorityMetrics>,
     ) -> SuiResult<(
-        Vec<Schedulable>,                      // non-randomness transactions to schedule
-        Vec<Schedulable>,                      // randomness transactions to schedule
+        VecDeque<Schedulable>, // non-randomness transactions to schedule
+        VecDeque<Schedulable>, // randomness transactions to schedule
         Vec<SequencedConsensusTransactionKey>, // keys to notify as complete
-        Option<RwLockWriteGuard<ReconfigState>>,
-        bool,                   // true if final round
-        Option<TransactionKey>, // consensus commit prologue root
-        AssignedTxAndVersions,
+        BTreeMap<TransactionDigest, CancelConsensusCertificateReason>, // cancelled transactions
     )> {
         let _scope = monitored_scope("ConsensusCommitHandler::process_consensus_transactions");
 
@@ -3772,23 +3892,6 @@ impl AuthorityPerEpochStore {
                 .push_back(Schedulable::RandomnessStateUpdate(self.epoch(), round));
         }
 
-        if self.accumulators_enabled() {
-            let checkpoint_height =
-                self.calculate_pending_checkpoint_height(consensus_commit_info.round);
-
-            let non_random_settlement =
-                Schedulable::AccumulatorSettlement(self.epoch(), checkpoint_height);
-            non_randomness_roots.insert(non_random_settlement.key());
-            verified_non_randomness_certificates.push_back(non_random_settlement);
-
-            if randomness_round.is_some() {
-                let randomness_settlement =
-                    Schedulable::AccumulatorSettlement(self.epoch(), checkpoint_height + 1);
-                randomness_roots.insert(randomness_settlement.key());
-                verified_randomness_certificates.push_back(randomness_settlement);
-            }
-        }
-
         for entry in non_randomness_transactions
             .iter()
             .map(Either::Left)
@@ -3815,7 +3918,7 @@ impl AuthorityPerEpochStore {
                     tx,
                     checkpoint_service,
                     consensus_commit_info,
-                    &mut indirect_state_observer,
+                    indirect_state_observer,
                     &previously_deferred_tx_digests,
                     randomness_manager.as_deref_mut(),
                     dkg_failed,
@@ -3878,7 +3981,6 @@ impl AuthorityPerEpochStore {
             }
         }
 
-        let commit_has_deferred_txns = !deferred_txns.is_empty();
         let mut total_deferred_txns = 0;
         {
             let mut deferred_transactions =
@@ -3931,41 +4033,11 @@ impl AuthorityPerEpochStore {
             }
         }
 
-        // Add the consensus commit prologue transaction to the beginning of `verified_non_randomness_certificates`.
-        let consensus_commit_prologue_root = self.add_consensus_commit_prologue_transaction(
-            output,
-            &mut verified_non_randomness_certificates,
-            consensus_commit_info,
-            indirect_state_observer,
-            &cancelled_txns,
-        )?;
-
-        let verified_non_randomness_certificates: Vec<_> =
-            verified_non_randomness_certificates.into();
-        let verified_randomness_certificates: Vec<_> = verified_randomness_certificates.into();
-
-        let assigned_tx_and_versions = self.process_consensus_transaction_shared_object_versions(
-            cache_reader,
-            &verified_non_randomness_certificates,
-            &verified_randomness_certificates,
-            &cancelled_txns,
-            output,
-        )?;
-
-        let (lock, final_round) = self.process_end_of_publish_transactions_and_reconfig(
-            output,
-            end_of_publish_transactions,
-            commit_has_deferred_txns,
-        )?;
-
         Ok((
             verified_non_randomness_certificates,
             verified_randomness_certificates,
             notifications,
-            lock,
-            final_round,
-            consensus_commit_prologue_root,
-            assigned_tx_and_versions,
+            cancelled_txns,
         ))
     }
 
@@ -3973,11 +4045,11 @@ impl AuthorityPerEpochStore {
         &self,
         output: &mut ConsensusCommitOutput,
         transactions: &[VerifiedSequencedConsensusTransaction],
-        commit_has_deferred_txns: bool,
     ) -> SuiResult<(
         Option<RwLockWriteGuard<ReconfigState>>,
         bool, // true if final round
     )> {
+        let commit_has_deferred_txns = output.has_deferred_transactions();
         let mut lock = None;
 
         for transaction in transactions {
@@ -4128,7 +4200,9 @@ impl AuthorityPerEpochStore {
                 )
             }
             SequencedConsensusTransactionKind::External(ConsensusTransaction {
-                kind: ConsensusTransactionKind::CheckpointSignature(info),
+                kind:
+                    ConsensusTransactionKind::CheckpointSignature(info)
+                    | ConsensusTransactionKind::CheckpointSignatureV2(info),
                 ..
             }) => {
                 // We usually call notify_checkpoint_signature in SuiTxValidator, but that step can
@@ -4362,7 +4436,7 @@ impl AuthorityPerEpochStore {
     ) -> SuiResult<ConsensusCertificateResult> {
         let _scope = monitored_scope("ConsensusCommitHandler::process_consensus_user_transaction");
 
-        if self.has_sent_end_of_publish(block_author)?
+        if self.has_received_end_of_publish_from(block_author)?
             && !previously_deferred_tx_digests.contains_key(transaction.digest())
         {
             // This can not happen with valid authority
@@ -4376,7 +4450,7 @@ impl AuthorityPerEpochStore {
         debug!(
             ?tracking_id,
             tx_digest = ?transaction.digest(),
-            "handle_consensus_transaction UserTransaction",
+            "Processing consensus transactions from user (CertifiedTransaction and UserTransaction)",
         );
 
         if !self
@@ -4469,10 +4543,29 @@ impl AuthorityPerEpochStore {
         Ok(ConsensusCertificateResult::SuiTransaction(transaction))
     }
 
+    /// If reconfig state is RejectUserCerts, and there is no fastpath transaction left to be
+    /// finalized, send EndOfPublish to signal to other authorities that this authority is
+    /// not voting for or executing more transactions in this epoch.
+    pub(crate) fn should_send_end_of_publish(&self) -> bool {
+        let reconfig_state = self.get_reconfig_state_read_lock_guard();
+        if !reconfig_state.is_reject_user_certs() {
+            // Still accepting user transactions, or already received 2f+1 EOP messages.
+            // Either way EOP cannot or does not need to be sent.
+            return false;
+        }
+
+        // EOP can only be sent after finalizing remaining transactions.
+        self.pending_consensus_certificates_empty()
+            && self
+                .consensus_tx_status_cache
+                .as_ref()
+                .is_none_or(|c| c.get_num_fastpath_certified() == 0)
+    }
+
     pub(crate) fn write_pending_checkpoint(
         &self,
         output: &mut ConsensusCommitOutput,
-        checkpoint: &PendingCheckpointV2,
+        checkpoint: &PendingCheckpoint,
     ) -> SuiResult {
         assert!(
             !self.pending_checkpoint_exists(&checkpoint.height())?,
@@ -4499,7 +4592,7 @@ impl AuthorityPerEpochStore {
     pub fn get_pending_checkpoints(
         &self,
         last: Option<CheckpointHeight>,
-    ) -> SuiResult<Vec<(CheckpointHeight, PendingCheckpointV2)>> {
+    ) -> SuiResult<Vec<(CheckpointHeight, PendingCheckpoint)>> {
         Ok(self
             .consensus_quarantine
             .read()
@@ -4803,6 +4896,23 @@ impl AuthorityPerEpochStore {
     ) {
         if let Some(cache) = self.consensus_tx_status_cache.as_ref() {
             cache.set_transaction_status(position, status);
+        }
+    }
+
+    pub(crate) fn set_rejection_vote_reason(&self, position: ConsensusPosition, reason: &SuiError) {
+        if let Some(tx_reject_reason_cache) = self.tx_reject_reason_cache.as_ref() {
+            tx_reject_reason_cache.set_rejection_vote_reason(position, reason);
+        }
+    }
+
+    pub(crate) fn get_rejection_vote_reason(
+        &self,
+        position: ConsensusPosition,
+    ) -> Option<SuiError> {
+        if let Some(tx_reject_reason_cache) = self.tx_reject_reason_cache.as_ref() {
+            tx_reject_reason_cache.get_rejection_vote_reason(position)
+        } else {
+            None
         }
     }
 

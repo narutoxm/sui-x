@@ -3,6 +3,24 @@
 
 use std::sync::Arc;
 
+use super::{
+    address::AddressableImpl,
+    object::{self, CVersion, Object, ObjectImpl, VersionFilter},
+    transaction::Transaction,
+};
+use crate::api::types::linkage::Linkage;
+use crate::api::types::type_origin::TypeOrigin;
+use crate::{
+    api::scalars::{
+        base64::Base64,
+        cursor::{BcsCursor, JsonCursor},
+        sui_address::SuiAddress,
+        uint53::UInt53,
+    },
+    error::{bad_user_input, RpcError},
+    pagination::{Page, PaginationConfig},
+    scope::Scope,
+};
 use anyhow::Context as _;
 use async_graphql::{
     connection::{Connection, CursorType, Edge},
@@ -24,24 +42,6 @@ use sui_types::{
     base_types::{ObjectID, SuiAddress as NativeSuiAddress},
     move_package::MovePackage as NativeMovePackage,
     object::Object as NativeObject,
-};
-
-use crate::{
-    api::scalars::{
-        base64::Base64,
-        cursor::{BcsCursor, JsonCursor},
-        sui_address::SuiAddress,
-        uint53::UInt53,
-    },
-    error::{bad_user_input, RpcError},
-    pagination::{Page, PaginationConfig},
-    scope::Scope,
-};
-
-use super::{
-    address::AddressableImpl,
-    object::{self, CVersion, Object, ObjectImpl, VersionFilter},
-    transaction::Transaction,
 };
 
 pub(crate) struct MovePackage {
@@ -71,7 +71,7 @@ pub(crate) struct PackageKey {
 
 /// Filter for paginating packages published within a range of checkpoints.
 #[derive(InputObject, Default, Debug)]
-pub(crate) struct CheckpointFilter {
+pub(crate) struct PackageCheckpointFilter {
     /// Filter to packages that were published strictly after this checkpoint, defaults to fetching from the earliest checkpoint known to this RPC (this could be the genesis checkpoint, or some later checkpoint if data has been pruned).
     pub(crate) after_checkpoint: Option<UInt53>,
 
@@ -118,6 +118,13 @@ impl MovePackage {
     /// 32-byte hash that identifies the package's contents, encoded in Base58.
     pub(crate) async fn digest(&self) -> String {
         ObjectImpl::from(&self.super_).digest()
+    }
+
+    /// BCS representation of the package's modules.  Modules appear as a sequence of pairs (module
+    /// name, followed by module bytes), in alphabetic order by module name.
+    async fn module_bcs(&self) -> Result<Option<Base64>, RpcError> {
+        let bytes = bcs::to_bytes(self.contents.serialized_module_map())?;
+        Ok(Some(bytes.into()))
     }
 
     /// Fetch the package as an object with the same ID, at a different version, root version bound, or checkpoint.
@@ -275,9 +282,44 @@ impl MovePackage {
             .previous_transaction(ctx)
             .await
     }
+
+    /// The transitive dependencies of this package.
+    async fn linkage(&self) -> Option<Vec<Linkage>> {
+        let linkage = self
+            .contents
+            .linkage_table()
+            .iter()
+            .map(|(object_id, upgrade_info)| Linkage {
+                object_id,
+                upgrade_info,
+            })
+            .collect();
+
+        Some(linkage)
+    }
+
+    /// A table identifying which versions of a package introduced each of its types.
+    async fn type_origins(&self) -> Option<Vec<TypeOrigin>> {
+        let type_origins = self
+            .contents
+            .type_origin_table()
+            .iter()
+            .map(|native| TypeOrigin::from(native.clone()))
+            .collect();
+
+        Some(type_origins)
+    }
 }
 
 impl MovePackage {
+    /// Create a `MovePackage` directly from a `NativeObject`. Returns `None` if the object
+    /// is not a package. This is more efficient when you already have the native object.
+    pub(crate) fn from_native_object(scope: Scope, native: NativeObject) -> Option<Self> {
+        let contents = native.data.try_as_package()?.clone();
+        let super_ = Object::from_contents(scope, Arc::new(native));
+        Some(Self { super_, contents })
+    }
+
     /// Try to downcast an `Object` to a `MovePackage`. This function returns `None` if `object`'s
     /// contents cannot be fetched, or it is not a package.
     pub(crate) async fn from_object(
@@ -504,7 +546,7 @@ impl MovePackage {
         ctx: &Context<'_>,
         scope: Scope,
         page: Page<CPackage>,
-        filter: CheckpointFilter,
+        filter: PackageCheckpointFilter,
     ) -> Result<Connection<String, MovePackage>, RpcError<Error>> {
         use kv_packages::dsl as p;
 

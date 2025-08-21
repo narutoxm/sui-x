@@ -1,9 +1,6 @@
 use std::{collections::BTreeMap, path::PathBuf};
 
-use serde::{
-    Deserialize, Deserializer,
-    de::{self, Visitor},
-};
+use serde::{Deserialize, Deserializer, de};
 use serde_spanned::Spanned;
 
 use super::{
@@ -42,26 +39,10 @@ pub struct PackageMetadata {
     pub edition: String,
 
     #[serde(default)]
-    pub implicit_deps: ImplicitDepMode,
+    pub system_dependencies: Option<Vec<String>>,
 
     #[serde(flatten)]
     pub unrecognized_fields: BTreeMap<String, toml::Value>,
-}
-
-/// The `implicit-deps` field of a manifest
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ImplicitDepMode {
-    /// There is no `implicit-deps` field
-    Enabled,
-
-    /// `implicit-deps = false`
-    Disabled,
-
-    /// this is only possible in a legacy package
-    Legacy,
-
-    /// `implicit-deps = "internal"`
-    Testing,
 }
 
 /// An entry in the `[dependencies]` section of a manifest
@@ -140,53 +121,6 @@ struct RField {
     r: BTreeMap<String, toml::Value>,
 }
 
-impl Default for ImplicitDepMode {
-    fn default() -> Self {
-        Self::Enabled
-    }
-}
-
-impl<'de> Deserialize<'de> for ImplicitDepMode {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        struct ImplicitDepModeVisitor;
-        impl Visitor<'_> for ImplicitDepModeVisitor {
-            type Value = ImplicitDepMode;
-
-            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-                // there's other things you can write, but we won't advertise that
-                formatter.write_str("the value false")
-            }
-
-            fn visit_bool<E: de::Error>(self, b: bool) -> Result<Self::Value, E> {
-                if b {
-                    Err(E::custom(
-                        "implicit-deps = true is the default behavior, so should be omitted",
-                    ))
-                } else {
-                    Ok(Self::Value::Disabled)
-                }
-            }
-
-            fn visit_str<E: de::Error>(self, s: &str) -> Result<Self::Value, E> {
-                if s == "internal" {
-                    Ok(Self::Value::Testing)
-                } else {
-                    // We hide the truth from the users! For testing in the monorepo, you may also pass
-                    // `implicit-deps = "internal"`
-                    Err(E::custom(
-                        "the only valid value for `implicit-deps` is `implicit-deps = false`",
-                    ))
-                }
-            }
-        }
-
-        deserializer.deserialize_any(ImplicitDepModeVisitor)
-    }
-}
-
 impl<'de> Deserialize<'de> for ManifestDependencyInfo {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -242,7 +176,7 @@ impl TryFrom<RField> for ExternalDependency {
 mod tests {
     use insta::assert_snapshot;
 
-    use crate::schema::{ImplicitDepMode, LocalDepInfo, OnChainDepInfo};
+    use crate::schema::{LocalDepInfo, OnChainDepInfo};
 
     use super::{
         DefaultDependency, ExternalDependency, ManifestDependencyInfo, ManifestGitDependency,
@@ -438,7 +372,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(manifest.package.implicit_deps == ImplicitDepMode::Enabled);
+        assert!(manifest.package.system_dependencies.is_none());
     }
 
     /// You can turn implicit deps off
@@ -449,50 +383,31 @@ mod tests {
             [package]
             name = "test"
             edition = "2024"
-            implicit-deps = false
+            system-dependencies = []
             "#,
         )
         .unwrap();
 
-        assert!(manifest.package.implicit_deps == ImplicitDepMode::Disabled);
+        assert!(manifest.package.system_dependencies == Some(vec![]));
     }
 
-    /// You can ask for internal implicit deps
+    /// You can define specific implicit deps.
     #[test]
-    fn parse_internal_implicit_deps() {
+    fn parse_specific_implicit_deps() {
         let manifest: ParsedManifest = toml_edit::de::from_str(
             r#"
-            [package]
-            name = "test"
-            edition = "2024"
-            implicit-deps = "internal"
-            "#,
+                [package]
+                name = "test"
+                edition = "2024"
+                system-dependencies = ["foo", "bar"]
+                "#,
         )
         .unwrap();
 
-        assert!(manifest.package.implicit_deps == ImplicitDepMode::Testing);
-    }
-
-    /// implicit deps can't be a random string
-    #[test]
-    fn parse_bad_implicit_deps() {
-        let error = toml_edit::de::from_str::<ParsedManifest>(
-            r#"
-            [package]
-            name = "test"
-            edition = "2024"
-            implicit-deps = "bogus"
-            "#,
-        )
-        .unwrap_err()
-        .to_string();
-        assert_snapshot!(error, @r###"
-        TOML parse error at line 5, column 29
-          |
-        5 |             implicit-deps = "bogus"
-          |                             ^^^^^^^
-        the only valid value for `implicit-deps` is `implicit-deps = false`
-        "###);
+        assert_eq!(
+            manifest.package.system_dependencies,
+            Some(vec!["foo".to_string(), "bar".to_string()])
+        );
     }
 
     // Dependency and dep-replacement parsing ////////////////////////////////////////////
