@@ -224,18 +224,25 @@ pub struct HandleCertificateRequestV3 {
 pub struct RawSubmitTxRequest {
     #[prost(bytes = "bytes", repeated, tag = "1")]
     pub transactions: Vec<Bytes>,
+
+    /// When submitting multiple transactions, attempt to include them in
+    /// the same block with the same order (soft bundle), if true.
+    /// Otherwise, allow the transactions to be included separately and
+    /// out of order in blocks (batch).
+    #[prost(bool, tag = "2")]
+    pub soft_bundle: bool,
 }
 
 #[derive(Clone, prost::Message)]
 pub struct RawSubmitTxResponse {
-    // Results for each transaction in the request
+    // Results corresponding to each transaction in the request.
     #[prost(message, repeated, tag = "1")]
     pub results: Vec<RawSubmitTxResult>,
 }
 
 #[derive(Clone, prost::Message)]
 pub struct RawSubmitTxResult {
-    #[prost(oneof = "RawValidatorSubmitStatus", tags = "1, 2")]
+    #[prost(oneof = "RawValidatorSubmitStatus", tags = "1, 2, 3")]
     pub inner: Option<RawValidatorSubmitStatus>,
 }
 
@@ -248,6 +255,10 @@ pub enum RawValidatorSubmitStatus {
     // Transaction has already been executed (finalized).
     #[prost(message, tag = "2")]
     Executed(RawExecutedStatus),
+
+    // Transaction is rejected from consensus submission.
+    #[prost(message, tag = "3")]
+    Rejected(RawRejectedStatus),
 }
 
 #[derive(Clone, prost::Message)]
@@ -293,6 +304,8 @@ pub struct RawExecutedStatus {
     pub effects_digest: Bytes,
     #[prost(message, optional, tag = "2")]
     pub details: Option<RawExecutedData>,
+    #[prost(bool, tag = "3")]
+    pub fast_path: bool,
 }
 
 #[derive(Clone, prost::Message)]

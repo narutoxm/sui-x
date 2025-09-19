@@ -8,12 +8,9 @@ use std::{
     time::Duration,
 };
 
+use crate::authority::{test_authority_builder::TestAuthorityBuilder, ExecutionEnv};
 use crate::{
-    authority::AuthorityState, authority_client::AuthorityAPI, transaction_driver::SubmitTxResponse,
-};
-use crate::{
-    authority::{test_authority_builder::TestAuthorityBuilder, ExecutionEnv},
-    execution_scheduler::ExecutionSchedulerAPI,
+    authority::AuthorityState, authority_client::AuthorityAPI, transaction_driver::SubmitTxResult,
 };
 use async_trait::async_trait;
 use consensus_types::block::BlockRef;
@@ -123,7 +120,11 @@ impl AuthorityAPI for LocalAuthorityClient {
             index: 0,
         };
 
-        SubmitTxResponse::Submitted { consensus_position }.try_into()
+        let submit_result = SubmitTxResult::Submitted { consensus_position };
+        let raw_result = submit_result.try_into()?;
+        Ok(RawSubmitTxResponse {
+            results: vec![raw_result],
+        })
     }
 
     async fn handle_transaction(

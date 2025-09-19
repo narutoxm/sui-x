@@ -8,6 +8,7 @@ use anemo_tower::trace::DefaultMakeSpan;
 use anemo_tower::trace::DefaultOnFailure;
 use anemo_tower::trace::TraceLayer;
 use anyhow::anyhow;
+use anyhow::Context;
 use anyhow::Result;
 use arc_swap::ArcSwap;
 use fastcrypto_zkp::bn254::zk_login::JwkId;
@@ -39,7 +40,7 @@ use sui_core::consensus_adapter::ConsensusClient;
 use sui_core::consensus_manager::UpdatableConsensusClient;
 use sui_core::epoch::randomness::RandomnessManager;
 use sui_core::execution_cache::build_execution_cache;
-use sui_core::execution_scheduler::ExecutionSchedulerAPI;
+
 use sui_core::execution_scheduler::SchedulingSource;
 use sui_core::global_state_hasher::GlobalStateHashMetrics;
 use sui_core::storage::RestReadStore;
@@ -63,7 +64,7 @@ use sui_types::transaction::VerifiedCertificate;
 use tap::tap::TapFallible;
 use tokio::sync::oneshot;
 use tokio::sync::{broadcast, mpsc, watch, Mutex};
-use tokio::task::{JoinHandle, JoinSet};
+use tokio::task::JoinHandle;
 use tower::ServiceBuilder;
 use tracing::{debug, error, warn};
 use tracing::{error_span, info, Instrument};
@@ -92,7 +93,7 @@ use sui_core::checkpoints::{
 use sui_core::consensus_adapter::{
     CheckConnection, ConnectionMonitorStatus, ConsensusAdapter, ConsensusAdapterMetrics,
 };
-use sui_core::consensus_manager::{ConsensusManager, ConsensusManagerTrait};
+use sui_core::consensus_manager::ConsensusManager;
 use sui_core::consensus_throughput_calculator::{
     ConsensusThroughputCalculator, ConsensusThroughputProfiler, ThroughputProfileRanges,
 };
@@ -163,8 +164,6 @@ pub struct ValidatorComponents {
     consensus_manager: Arc<ConsensusManager>,
     consensus_store_pruner: ConsensusStorePruner,
     consensus_adapter: Arc<ConsensusAdapter>,
-    // Keeping the handle to the checkpoint service tasks to shut them down during reconfiguration.
-    checkpoint_service_tasks: JoinSet<()>,
     checkpoint_metrics: Arc<CheckpointMetrics>,
     sui_tx_validator_metrics: Arc<SuiTxValidatorMetrics>,
 }
@@ -1457,7 +1456,9 @@ impl SuiNode {
         } else {
             Some(replay_waiter)
         };
-        let checkpoint_service_tasks = checkpoint_service.spawn(replay_waiter).await;
+        checkpoint_service
+            .spawn(epoch_store.clone(), replay_waiter)
+            .await;
 
         if epoch_store.authenticator_state_enabled() {
             Self::start_jwk_updater(
@@ -1475,7 +1476,6 @@ impl SuiNode {
             consensus_manager,
             consensus_store_pruner,
             consensus_adapter,
-            checkpoint_service_tasks,
             checkpoint_metrics,
             sui_tx_validator_metrics,
         })
@@ -1930,25 +1930,11 @@ impl SuiNode {
                 consensus_manager,
                 consensus_store_pruner,
                 consensus_adapter,
-                mut checkpoint_service_tasks,
                 checkpoint_metrics,
                 sui_tx_validator_metrics,
             }) = validator_components_lock_guard.take()
             {
                 info!("Reconfiguring the validator.");
-                // Cancel the old checkpoint service tasks.
-                // Waiting for checkpoint builder to finish gracefully is not possible, because it
-                // may wait on transactions while consensus on peers have already shut down.
-                checkpoint_service_tasks.abort_all();
-                while let Some(result) = checkpoint_service_tasks.join_next().await {
-                    if let Err(err) = result {
-                        if err.is_panic() {
-                            std::panic::resume_unwind(err.into_panic());
-                        }
-                        warn!("Error in checkpoint service task: {:?}", err);
-                    }
-                }
-                info!("Checkpoint service has shut down.");
 
                 consensus_manager.shutdown().await;
                 info!("Consensus has shut down.");
@@ -2202,8 +2188,34 @@ impl SuiNode {
         checkpoint_store: &CheckpointStore,
         recovery: &ForkRecoveryConfig,
     ) -> Result<()> {
-        if recovery.checkpoint_overrides.is_empty() {
-            return Ok(());
+        // If configured overrides include a checkpoint whose locally computed digest mismatches,
+        // clear locally computed checkpoints from that sequence (inclusive).
+        for (seq, expected_digest_str) in &recovery.checkpoint_overrides {
+            let Ok(expected_digest) = CheckpointDigest::from_str(expected_digest_str) else {
+                anyhow::bail!(
+                    "Invalid checkpoint digest override for seq {}: {}",
+                    seq,
+                    expected_digest_str
+                );
+            };
+
+            if let Some(local_summary) = checkpoint_store.get_locally_computed_checkpoint(*seq)? {
+                let local_digest = sui_types::message_envelope::Message::digest(&local_summary);
+                if local_digest != expected_digest {
+                    info!(
+                        seq,
+                        local = %Self::get_digest_prefix(local_digest),
+                        expected = %Self::get_digest_prefix(expected_digest),
+                        "Fork recovery: clearing locally_computed_checkpoints from {} due to digest mismatch",
+                        seq
+                    );
+                    checkpoint_store
+                        .clear_locally_computed_checkpoints_from(*seq)
+                        .context(
+                            "Failed to clear locally computed checkpoints from override seq",
+                        )?;
+                }
+            }
         }
 
         if let Some((checkpoint_seq, checkpoint_digest)) =

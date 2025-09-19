@@ -35,6 +35,21 @@ pub use guards::*;
 pub const TX_TYPE_SINGLE_WRITER_TX: &str = "single_writer";
 pub const TX_TYPE_SHARED_OBJ_TX: &str = "shared_object";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TxType {
+    SingleWriter,
+    SharedObject,
+}
+
+impl TxType {
+    pub fn as_str(&self) -> &str {
+        match self {
+            TxType::SingleWriter => TX_TYPE_SINGLE_WRITER_TX,
+            TxType::SharedObject => TX_TYPE_SHARED_OBJ_TX,
+        }
+    }
+}
+
 /// Used when latency is most definitely sub-second.
 pub const SUBSECOND_LATENCY_SEC_BUCKETS: &[f64] = &[
     0.001, 0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.125, 0.15, 0.175, 0.2, 0.225, 0.25, 0.275, 0.3,
@@ -57,12 +72,13 @@ pub const LATENCY_SEC_BUCKETS: &[f64] = &[
 ];
 
 pub const COUNT_BUCKETS: &[f64] = &[
-    2., 5., 10., 20., 50., 100., 200., 500., 1000., 2000., 5000., 10000.,
+    1., 2., 3., 4., 5., 7., 10., 15., 20., 25., 30., 40., 50., 75., 100., 150., 200., 500., 1000.,
+    2000., 5000., 10000.,
 ];
 
 pub const BYTES_BUCKETS: &[f64] = &[
-    1024., 4096., 16384., 65536., 262144., 524288., 1048576., 2097152., 4194304., 8388608.,
-    16777216., 33554432., 67108864.,
+    1., 4., 16., 64., 256., 1024., 4096., 16384., 65536., 262144., 524288., 1048576., 2097152.,
+    4194304., 8388608., 16777216., 33554432., 67108864.,
 ];
 
 #[derive(Debug)]

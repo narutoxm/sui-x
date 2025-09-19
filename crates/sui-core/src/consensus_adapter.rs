@@ -48,7 +48,7 @@ use tokio::sync::{oneshot, Semaphore, SemaphorePermit};
 use tokio::task::JoinHandle;
 use tokio::time::Duration;
 use tokio::time::{self};
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, debug_span, info, instrument, trace, warn, Instrument};
 
 use crate::authority::authority_per_epoch_store::AuthorityPerEpochStore;
 use crate::checkpoints::CheckpointStore;
@@ -632,17 +632,38 @@ impl ConsensusAdapter {
         tx_consensus_position: Option<oneshot::Sender<Vec<ConsensusPosition>>>,
     ) -> SuiResult<JoinHandle<()>> {
         if transactions.len() > 1 {
-            // In soft bundle, we need to check if all transactions are of CertifiedTransaction
-            // kind. The check is required because we assume this in submit_and_wait_inner.
-            for transaction in transactions {
-                fp_ensure!(
-                    matches!(
-                        transaction.kind,
-                        ConsensusTransactionKind::CertifiedTransaction(_)
-                    ),
-                    SuiError::InvalidTxKindInSoftBundle
-                );
-                // TODO(fastpath): support batch of UserTransaction.
+            // When batching multiple transactions, ensure they are all of the same kind
+            // (either all CertifiedTransaction or all UserTransaction).
+            // This makes classifying the transactions easier in later steps.
+            let first_kind = &transactions[0].kind;
+            let is_user_tx_batch =
+                matches!(first_kind, ConsensusTransactionKind::UserTransaction(_));
+            let is_cert_batch = matches!(
+                first_kind,
+                ConsensusTransactionKind::CertifiedTransaction(_)
+            );
+
+            for transaction in &transactions[1..] {
+                if is_user_tx_batch {
+                    fp_ensure!(
+                        matches!(
+                            transaction.kind,
+                            ConsensusTransactionKind::UserTransaction(_)
+                        ),
+                        SuiError::InvalidTxKindInSoftBundle
+                    );
+                } else if is_cert_batch {
+                    fp_ensure!(
+                        matches!(
+                            transaction.kind,
+                            ConsensusTransactionKind::CertifiedTransaction(_)
+                        ),
+                        SuiError::InvalidTxKindInSoftBundle
+                    );
+                } else {
+                    // Other transaction kinds cannot be batched
+                    return Err(SuiError::InvalidTxKindInSoftBundle);
+                }
             }
         }
 
@@ -670,11 +691,14 @@ impl ConsensusAdapter {
         tx_consensus_position: Option<oneshot::Sender<Vec<ConsensusPosition>>>,
     ) -> JoinHandle<()> {
         // Reconfiguration lock is dropped when pending_consensus_transactions is persisted, before it is handled by consensus
-        let async_stage = self.clone().submit_and_wait(
-            transactions.to_vec(),
-            epoch_store.clone(),
-            tx_consensus_position,
-        );
+        let async_stage = self
+            .clone()
+            .submit_and_wait(
+                transactions.to_vec(),
+                epoch_store.clone(),
+                tx_consensus_position,
+            )
+            .in_current_span();
         // Number of these tasks is weakly limited based on `num_inflight_transactions`.
         // (Limit is not applied atomically, and only to user transactions.)
         let join_handle = spawn_monitored_task!(async_stage);
@@ -709,6 +733,7 @@ impl ConsensusAdapter {
     }
 
     #[allow(clippy::option_map_unit_fn)]
+    #[instrument(name="ConsensusAdapter::submit_and_wait_inner", level="trace", skip_all, fields(tx_count = ?transactions.len(), tx_type = tracing::field::Empty, tx_keys = tracing::field::Empty, submit_status = tracing::field::Empty, consensus_positions = tracing::field::Empty))]
     async fn submit_and_wait_inner(
         self: Arc<Self>,
         transactions: Vec<ConsensusTransaction>,
@@ -725,8 +750,8 @@ impl ConsensusAdapter {
         let skip_processed_checks = tx_consensus_positions.is_some();
 
         // Current code path ensures:
-        // - If transactions.len() > 1, it is a soft bundle. Otherwise transactions should have been submitted individually.
-        // - If is_soft_bundle, then all transactions are of UserTransaction kind.
+        // - If transactions.len() > 1, it is a soft bundle. System transactions should have been submitted individually.
+        // - If is_soft_bundle, then all transactions are of CertifiedTransaction or UserTransaction kind.
         // - If not is_soft_bundle, then transactions must contain exactly 1 tx, and transactions[0] can be of any kind.
         let is_soft_bundle = transactions.len() > 1;
 
@@ -742,11 +767,13 @@ impl ConsensusAdapter {
             let transaction_key = SequencedConsensusTransactionKey::External(transaction.key());
             transaction_keys.push(transaction_key);
         }
-        let tx_type = if !is_soft_bundle {
-            classify(&transactions[0])
-        } else {
+        let tx_type = if is_soft_bundle {
             "soft_bundle"
+        } else {
+            classify(&transactions[0])
         };
+        tracing::Span::current().record("tx_type", tx_type);
+        tracing::Span::current().record("tx_keys", tracing::field::debug(&transaction_keys));
 
         let mut guard = InflightDropGuard::acquire(&self, tx_type);
 
@@ -781,15 +808,18 @@ impl ConsensusAdapter {
         };
 
         // Log warnings for administrative transactions that fail to get sequenced
-        let _monitor = if !is_soft_bundle
-            && matches!(
-                transactions[0].kind,
-                ConsensusTransactionKind::EndOfPublish(_)
-                    | ConsensusTransactionKind::CapabilityNotification(_)
-                    | ConsensusTransactionKind::CapabilityNotificationV2(_)
-                    | ConsensusTransactionKind::RandomnessDkgMessage(_, _)
-                    | ConsensusTransactionKind::RandomnessDkgConfirmation(_, _)
-            ) {
+        let _monitor = if matches!(
+            transactions[0].kind,
+            ConsensusTransactionKind::EndOfPublish(_)
+                | ConsensusTransactionKind::CapabilityNotification(_)
+                | ConsensusTransactionKind::CapabilityNotificationV2(_)
+                | ConsensusTransactionKind::RandomnessDkgMessage(_, _)
+                | ConsensusTransactionKind::RandomnessDkgConfirmation(_, _)
+        ) {
+            assert!(
+                !is_soft_bundle,
+                "System transactions should have been submitted individually"
+            );
             let transaction_keys = transaction_keys.clone();
             Some(CancelOnDrop(spawn_monitored_task!(async {
                 let mut i = 0u64;
@@ -845,6 +875,10 @@ impl ConsensusAdapter {
                         .await;
 
                     if let Some(tx_consensus_positions) = tx_consensus_positions.take() {
+                        tracing::Span::current().record(
+                            "consensus_positions",
+                            tracing::field::debug(&consensus_positions),
+                        );
                         // We send the first consensus position returned by consensus
                         // to the submitting client even if it is retried internally within
                         // consensus adapter due to an error or GC. They can handle retries
@@ -854,7 +888,9 @@ impl ConsensusAdapter {
                     }
 
                     match status_waiter.await {
-                        Ok(BlockStatus::Sequenced(_)) => {
+                        Ok(status @ BlockStatus::Sequenced(_)) => {
+                            tracing::Span::current()
+                                .record("status", tracing::field::debug(&status));
                             self.metrics
                                 .sequencing_certificate_status
                                 .with_label_values(&[tx_type, "sequenced"])
@@ -865,7 +901,9 @@ impl ConsensusAdapter {
                             );
                             break;
                         }
-                        Ok(BlockStatus::GarbageCollected(_)) => {
+                        Ok(status @ BlockStatus::GarbageCollected(_)) => {
+                            tracing::Span::current()
+                                .record("status", tracing::field::debug(&status));
                             self.metrics
                                 .sequencing_certificate_status
                                 .with_label_values(&[tx_type, "garbage_collected"])
@@ -951,6 +989,7 @@ impl ConsensusAdapter {
             .inc();
     }
 
+    #[instrument(name = "ConsensusAdapter::submit_inner", level = "trace", skip_all)]
     async fn submit_inner(
         self: &Arc<Self>,
         transactions: &[ConsensusTransaction],
@@ -963,9 +1002,11 @@ impl ConsensusAdapter {
         let mut retries: u32 = 0;
 
         let (consensus_positions, status_waiter) = loop {
+            let span = debug_span!("client_submit");
             match self
                 .consensus_client
                 .submit(transactions, epoch_store)
+                .instrument(span)
                 .await
             {
                 Err(err) => {
@@ -984,7 +1025,7 @@ impl ConsensusAdapter {
                         .inc();
                     retries += 1;
 
-                    if !is_soft_bundle && transactions[0].kind.is_dkg() {
+                    if transactions[0].kind.is_dkg() {
                         // Shorter delay for DKG messages, which are time-sensitive and happen at
                         // start-of-epoch when submit errors due to active reconfig are likely.
                         time::sleep(Duration::from_millis(100)).await;

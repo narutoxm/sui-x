@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use itertools::Itertools as _;
 use sui_types::{
@@ -58,6 +59,9 @@ impl TransactionRequestError {
 /// NOTE: every error should indicate if it is retriable.
 #[derive(Eq, PartialEq, Clone)]
 pub enum TransactionDriverError {
+    /// TransactionDriver encountered an internal error.
+    /// Retriable.
+    Internal { error: String },
     /// Transient failure during transaction processing that prevents the transaction from finalization.
     /// Retriable with new transaction submission / call to TransactionDriver.
     Aborted {
@@ -79,14 +83,23 @@ pub enum TransactionDriverError {
         submission_non_retriable_errors: AggregatedRequestErrors,
         submission_retriable_errors: AggregatedRequestErrors,
     },
+    /// Transaction timed out but we return last retriable error if it exists.
+    /// Non-retriable.
+    TimeoutWithLastRetriableError {
+        last_error: Option<Box<TransactionDriverError>>,
+        attempts: u32,
+        timeout: Duration,
+    },
 }
 
 impl TransactionDriverError {
     pub fn is_retriable(&self) -> bool {
         match self {
+            TransactionDriverError::Internal { .. } => true,
             TransactionDriverError::Aborted { .. } => true,
             TransactionDriverError::InvalidTransaction { .. } => false,
             TransactionDriverError::ForkedExecution { .. } => false,
+            TransactionDriverError::TimeoutWithLastRetriableError { .. } => true,
         }
     }
 
@@ -171,11 +184,28 @@ impl TransactionDriverError {
 impl std::fmt::Display for TransactionDriverError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            TransactionDriverError::Internal { error } => write!(f, "Internal error: {}", error),
             TransactionDriverError::Aborted { .. } => self.display_aborted(f),
             TransactionDriverError::InvalidTransaction { .. } => {
                 self.display_invalid_transaction(f)
             }
             TransactionDriverError::ForkedExecution { .. } => self.display_forked_execution(f),
+            TransactionDriverError::TimeoutWithLastRetriableError {
+                last_error,
+                attempts,
+                timeout,
+            } => {
+                write!(
+                    f,
+                    "Transaction timed out after {} attempts. Timeout: {:?}. Last error: {}",
+                    attempts,
+                    timeout,
+                    last_error
+                        .as_ref()
+                        .map(|e| e.to_string())
+                        .unwrap_or_default()
+                )
+            }
         }
     }
 }
