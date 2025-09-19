@@ -7,7 +7,8 @@ use std::{
 };
 
 use sui_types::{
-    base_types::AuthorityName, digests::TransactionDigest, messages_grpc::RawSubmitTxRequest,
+    base_types::AuthorityName, digests::TransactionDigest, error::SuiError,
+    messages_grpc::RawSubmitTxRequest,
 };
 use tokio::time::timeout;
 use tracing::instrument;
@@ -19,7 +20,7 @@ use crate::{
     transaction_driver::{
         error::{TransactionDriverError, TransactionRequestError},
         request_retrier::RequestRetrier,
-        SubmitTransactionOptions, SubmitTxResponse, TransactionDriverMetrics,
+        SubmitTransactionOptions, SubmitTxResult, TransactionDriverMetrics,
     },
     validator_client_monitor::{OperationFeedback, OperationType, ValidatorClientMonitor},
 };
@@ -35,7 +36,7 @@ impl TransactionSubmitter {
         Self { metrics }
     }
 
-    #[instrument(level = "error", skip_all, fields(tx_digest = ?tx_digest))]
+    #[instrument(level = "debug", skip_all, err(level = "debug"), fields(tx_digest = ?tx_digest))]
     pub(crate) async fn submit_transaction<A>(
         &self,
         authority_aggregator: &Arc<AuthorityAggregator<A>>,
@@ -43,7 +44,7 @@ impl TransactionSubmitter {
         tx_digest: &TransactionDigest,
         raw_request: RawSubmitTxRequest,
         options: &SubmitTransactionOptions,
-    ) -> Result<(AuthorityName, SubmitTxResponse), TransactionDriverError>
+    ) -> Result<(AuthorityName, SubmitTxResult), TransactionDriverError>
     where
         A: AuthorityAPI + Send + Sync + 'static + Clone,
     {
@@ -67,24 +68,22 @@ impl TransactionSubmitter {
                     options,
                     client_monitor,
                     name,
-                    authority_aggregator,
+                    display_name.clone(),
                 )
                 .await
             {
-                Ok(resp) => {
+                Ok(result) => {
                     self.metrics
                         .validator_submit_transaction_successes
                         .with_label_values(&[&display_name])
                         .inc();
-
                     self.metrics
                         .submit_transaction_retries
                         .observe(retries as f64);
-
                     let elapsed = start_time.elapsed().as_secs_f64();
                     self.metrics.submit_transaction_latency.observe(elapsed);
 
-                    return Ok((name, resp));
+                    return Ok((name, result));
                 }
                 Err(e) => {
                     let error_type = if e.is_submission_retriable() {
@@ -106,7 +105,7 @@ impl TransactionSubmitter {
         }
     }
 
-    #[instrument(level = "error", skip_all)]
+    #[instrument(level = "debug", skip_all, err(level = "debug"), ret, fields(validator_display_name = ?display_name))]
     async fn submit_transaction_once<A>(
         &self,
         client: Arc<SafeClient<A>>,
@@ -114,13 +113,12 @@ impl TransactionSubmitter {
         options: &SubmitTransactionOptions,
         client_monitor: &Arc<ValidatorClientMonitor<A>>,
         validator: AuthorityName,
-        authority_aggregator: &Arc<AuthorityAggregator<A>>,
-    ) -> Result<SubmitTxResponse, TransactionRequestError>
+        display_name: String,
+    ) -> Result<SubmitTxResult, TransactionRequestError>
     where
         A: AuthorityAPI + Send + Sync + 'static + Clone,
     {
         let submit_start = Instant::now();
-        let display_name = authority_aggregator.get_display_name(&validator);
 
         let resp = timeout(
             SUBMIT_TRANSACTION_TIMEOUT,
@@ -136,11 +134,22 @@ impl TransactionSubmitter {
             });
             TransactionRequestError::TimedOutSubmittingTransaction
         })?
-        // TODO: Note that we do not record this error in the client monitor
+        // TODO(fastpath): Note that we do not record this error in the client monitor
         // because it may be due to invalid transactions.
         // To fully utilize this error, we need to either pre-check the transaction
-        // on the fullnode, or be able to categrize the error.
+        // on the fullnode, or be able to categorize the error.
         .map_err(TransactionRequestError::RejectedAtValidator)?;
+
+        let result = resp.results.into_iter().next().ok_or_else(|| {
+            TransactionRequestError::Aborted(SuiError::GenericAuthorityError {
+                error: "No result in SubmitTxResponse".to_string(),
+            })
+        })?;
+
+        // Since only one transaction is submitted, it is ok to return error when the submission is rejected.
+        if let SubmitTxResult::Rejected { error } = result {
+            return Err(TransactionRequestError::RejectedAtValidator(error));
+        }
 
         let latency = submit_start.elapsed();
         client_monitor.record_interaction_result(OperationFeedback {
@@ -149,6 +158,6 @@ impl TransactionSubmitter {
             operation: OperationType::Submit,
             result: Ok(latency),
         });
-        Ok(resp)
+        Ok(result)
     }
 }

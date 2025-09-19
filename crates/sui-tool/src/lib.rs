@@ -67,6 +67,7 @@ use sui_types::storage::ReadStore;
 use tracing::{error, info};
 
 pub mod commands;
+#[cfg(not(tidehunter))]
 pub mod db_tool;
 mod formal_snapshot_util;
 
@@ -948,6 +949,7 @@ pub async fn download_formal_snapshot(
                 );
                 progress_bar.finish_with_message("Verification complete");
             }
+            _ => return Err(anyhow!("Expected ECMHLiveObjectSetDigest")),
         };
     } else {
         m.println(
