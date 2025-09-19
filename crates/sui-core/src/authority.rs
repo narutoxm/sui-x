@@ -334,6 +334,16 @@ pub struct AuthorityMetrics {
     db_checkpoint_latency: Histogram,
 
     // TODO: Rename these metrics.
+    pub(crate) transaction_manager_num_missing_objects: IntGauge,
+    pub(crate) transaction_manager_object_cache_size: IntGauge,
+    pub(crate) transaction_manager_object_cache_hits: IntCounter,
+    pub(crate) transaction_manager_object_cache_misses: IntCounter,
+    pub(crate) transaction_manager_object_cache_evictions: IntCounter,
+    pub(crate) transaction_manager_package_cache_size: IntGauge,
+    pub(crate) transaction_manager_package_cache_hits: IntCounter,
+    pub(crate) transaction_manager_package_cache_misses: IntCounter,
+    pub(crate) transaction_manager_package_cache_evictions: IntCounter,
+    pub(crate) transaction_manager_transaction_queue_age_s: Histogram,
     pub(crate) transaction_manager_num_enqueued_certificates: IntCounterVec,
     pub(crate) transaction_manager_num_pending_certificates: IntGauge,
     pub(crate) transaction_manager_num_executing_certificates: IntGauge,
@@ -614,6 +624,36 @@ impl AuthorityMetrics {
                 "The percentage of transactions is shed when the authority is in load shedding mode.",
                 registry)
             .unwrap(),
+            transaction_manager_object_cache_misses: register_int_counter_with_registry!(
+                "transaction_manager_object_cache_misses",
+                "Number of object-availability cache misses in TransactionManager",
+                registry,
+            )
+            .unwrap(),
+            transaction_manager_object_cache_hits: register_int_counter_with_registry!(
+                "transaction_manager_object_cache_hits",
+                "Number of object-availability cache hits in TransactionManager",
+                registry,
+            )
+            .unwrap(),
+            transaction_manager_package_cache_hits: register_int_counter_with_registry!(
+                "transaction_manager_package_cache_hits",
+                "Number of package-availability cache hits in TransactionManager",
+                registry,
+            )
+            .unwrap(),
+            transaction_manager_package_cache_misses: register_int_counter_with_registry!(
+                "transaction_manager_package_cache_misses",
+                "Number of package-availability cache misses in TransactionManager",
+                registry,
+            )
+            .unwrap(),
+            transaction_manager_package_cache_evictions: register_int_counter_with_registry!(
+                "transaction_manager_package_cache_evictions",
+                "Number of package-availability cache evictions in TransactionManager",
+                registry,
+            )
+            .unwrap(),
             transaction_manager_transaction_queue_age_s: register_histogram_with_registry!(
                 "transaction_manager_transaction_queue_age_s",
                 "Time spent in waiting for transaction in the queue",
@@ -658,6 +698,18 @@ impl AuthorityMetrics {
                 "The ratio of computation gas divided by certificate execution latency, include committing certificate.",
                 GAS_LATENCY_RATIO_BUCKETS.to_vec(),
                 registry
+            )
+            .unwrap(),
+            transaction_manager_object_cache_evictions: register_int_counter_with_registry!(
+                "transaction_manager_object_cache_evictions",
+                "Number of object-availability cache evictions in TransactionManager",
+                registry,
+            )
+            .unwrap(),
+            transaction_manager_package_cache_size: register_int_gauge_with_registry!(
+                "transaction_manager_package_cache_size",
+                "Current size of package-availability cache in TransactionManager",
+                registry,
             )
             .unwrap(),
             skipped_consensus_txns: register_int_counter_with_registry!(

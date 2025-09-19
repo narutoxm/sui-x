@@ -64,15 +64,6 @@ pub struct ExecutingGuard {
     num_executing_certificates: IntGauge,
 }
 
-impl ExecutingGuard {
-    pub fn new(num_executing_certificates: IntGauge) -> Self {
-        num_executing_certificates.inc();
-        Self {
-            num_executing_certificates,
-        }
-    }
-}
-
 #[enum_dispatch]
 pub trait ExecutionSchedulerAPI {
     fn enqueue_transactions(
