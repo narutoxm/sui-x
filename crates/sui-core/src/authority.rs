@@ -9,6 +9,7 @@ use crate::cache_update_handler::pool_related_object_ids;
 use crate::cache_update_handler::CacheUpdateHandler;
 use crate::consensus_adapter::ConsensusOverloadChecker;
 use crate::execution_cache::ExecutionCacheTraitPointers;
+use crate::execution_scheduler::ExecutionSchedulerWrapper;
 use crate::execution_cache::TransactionCacheRead;
 use crate::execution_scheduler::ExecutionScheduler;
 use crate::execution_scheduler::SchedulingSource;
