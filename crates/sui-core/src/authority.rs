@@ -10,7 +10,8 @@ use crate::cache_update_handler::CacheUpdateHandler;
 use crate::consensus_adapter::ConsensusOverloadChecker;
 use crate::execution_cache::ExecutionCacheTraitPointers;
 use crate::execution_cache::TransactionCacheRead;
-use crate::execution_scheduler::ExecutionScheduler;
+use crate::execution_scheduler::ExecutionSchedulerAPI;
+use crate::execution_scheduler::ExecutionSchedulerWrapper;
 use crate::execution_scheduler::SchedulingSource;
 use crate::jsonrpc_index::CoinIndexKey2;
 use crate::override_cache::InputLoaderCache;
@@ -332,8 +333,18 @@ pub struct AuthorityMetrics {
 
     // TODO: Rename these metrics.
     pub(crate) transaction_manager_num_enqueued_certificates: IntCounterVec,
+    pub(crate) transaction_manager_num_missing_objects: IntGauge,
     pub(crate) transaction_manager_num_pending_certificates: IntGauge,
     pub(crate) transaction_manager_num_executing_certificates: IntGauge,
+    pub(crate) transaction_manager_num_ready: IntGauge,
+    pub(crate) transaction_manager_object_cache_size: IntGauge,
+    pub(crate) transaction_manager_object_cache_hits: IntCounter,
+    pub(crate) transaction_manager_object_cache_misses: IntCounter,
+    pub(crate) transaction_manager_object_cache_evictions: IntCounter,
+    pub(crate) transaction_manager_package_cache_size: IntGauge,
+    pub(crate) transaction_manager_package_cache_hits: IntCounter,
+    pub(crate) transaction_manager_package_cache_misses: IntCounter,
+    pub(crate) transaction_manager_package_cache_evictions: IntCounter,
     pub(crate) transaction_manager_transaction_queue_age_s: Histogram,
 
     pub(crate) execution_driver_executed_transactions: IntCounter,
@@ -368,8 +379,6 @@ pub struct AuthorityMetrics {
     pub consensus_committed_subdags: IntCounterVec,
     pub consensus_committed_messages: IntGaugeVec,
     pub consensus_committed_user_transactions: IntGaugeVec,
-    pub consensus_finalized_user_transactions: IntGaugeVec,
-    pub consensus_rejected_user_transactions: IntGaugeVec,
     pub consensus_calculated_throughput: IntGauge,
     pub consensus_calculated_throughput_profile: IntGauge,
     pub consensus_block_handler_block_processed: IntCounter,
@@ -584,20 +593,44 @@ impl AuthorityMetrics {
             ).unwrap(),
             transaction_manager_num_enqueued_certificates: register_int_counter_vec_with_registry!(
                 "transaction_manager_num_enqueued_certificates",
-                "Current number of certificates enqueued to ExecutionScheduler",
+                "Current number of certificates enqueued to TransactionManager",
                 &["result"],
+                registry,
+            )
+            .unwrap(),
+            transaction_manager_num_missing_objects: register_int_gauge_with_registry!(
+                "transaction_manager_num_missing_objects",
+                "Current number of missing objects in TransactionManager",
                 registry,
             )
             .unwrap(),
             transaction_manager_num_pending_certificates: register_int_gauge_with_registry!(
                 "transaction_manager_num_pending_certificates",
-                "Number of certificates pending in ExecutionScheduler, with at least 1 missing input object",
+                "Number of certificates pending in TransactionManager, with at least 1 missing input object",
                 registry,
             )
             .unwrap(),
             transaction_manager_num_executing_certificates: register_int_gauge_with_registry!(
                 "transaction_manager_num_executing_certificates",
                 "Number of executing certificates, including queued and actually running certificates",
+                registry,
+            )
+            .unwrap(),
+            transaction_manager_num_ready: register_int_gauge_with_registry!(
+                "transaction_manager_num_ready",
+                "Number of ready transactions in TransactionManager",
+                registry,
+            )
+            .unwrap(),
+            transaction_manager_object_cache_size: register_int_gauge_with_registry!(
+                "transaction_manager_object_cache_size",
+                "Current size of object-availability cache in TransactionManager",
+                registry,
+            )
+            .unwrap(),
+            transaction_manager_object_cache_hits: register_int_counter_with_registry!(
+                "transaction_manager_object_cache_hits",
+                "Number of object-availability cache hits in TransactionManager",
                 registry,
             )
             .unwrap(),
@@ -610,6 +643,42 @@ impl AuthorityMetrics {
                 "authority_load_shedding_percentage",
                 "The percentage of transactions is shed when the authority is in load shedding mode.",
                 registry)
+            .unwrap(),
+            transaction_manager_object_cache_misses: register_int_counter_with_registry!(
+                "transaction_manager_object_cache_misses",
+                "Number of object-availability cache misses in TransactionManager",
+                registry,
+            )
+            .unwrap(),
+            transaction_manager_object_cache_evictions: register_int_counter_with_registry!(
+                "transaction_manager_object_cache_evictions",
+                "Number of object-availability cache evictions in TransactionManager",
+                registry,
+            )
+            .unwrap(),
+            transaction_manager_package_cache_size: register_int_gauge_with_registry!(
+                "transaction_manager_package_cache_size",
+                "Current size of package-availability cache in TransactionManager",
+                registry,
+            )
+            .unwrap(),
+            transaction_manager_package_cache_hits: register_int_counter_with_registry!(
+                "transaction_manager_package_cache_hits",
+                "Number of package-availability cache hits in TransactionManager",
+                registry,
+            )
+            .unwrap(),
+            transaction_manager_package_cache_misses: register_int_counter_with_registry!(
+                "transaction_manager_package_cache_misses",
+                "Number of package-availability cache misses in TransactionManager",
+                registry,
+            )
+            .unwrap(),
+            transaction_manager_package_cache_evictions: register_int_counter_with_registry!(
+                "transaction_manager_package_cache_evictions",
+                "Number of package-availability cache evictions in TransactionManager",
+                registry,
+            )
             .unwrap(),
             transaction_manager_transaction_queue_age_s: register_histogram_with_registry!(
                 "transaction_manager_transaction_queue_age_s",
@@ -752,19 +821,7 @@ impl AuthorityMetrics {
             ).unwrap(),
             consensus_committed_user_transactions: register_int_gauge_vec_with_registry!(
                 "consensus_committed_user_transactions",
-                "Number of certified & user transactions committed, sliced by submitter and persisted across restarts within each epoch",
-                &["authority"],
-                registry,
-            ).unwrap(),
-            consensus_finalized_user_transactions: register_int_gauge_vec_with_registry!(
-                "consensus_finalized_user_transactions",
-                "Number of user transactions finalized, sliced by submitter",
-                &["authority"],
-                registry,
-            ).unwrap(),
-            consensus_rejected_user_transactions: register_int_gauge_vec_with_registry!(
-                "consensus_rejected_user_transactions",
-                "Number of user transactions rejected, sliced by submitter",
+                "Number of committed user transactions, sliced by submitter",
                 &["authority"],
                 registry,
             ).unwrap(),
@@ -894,12 +951,15 @@ pub struct ForkRecoveryState {
     /// Transaction digest to effects digest overrides
     transaction_overrides:
         parking_lot::RwLock<HashMap<TransactionDigest, TransactionEffectsDigest>>,
+    /// Checkpoint sequence to checkpoint digest overrides  
+    checkpoint_overrides: parking_lot::RwLock<HashMap<CheckpointSequenceNumber, CheckpointDigest>>,
 }
 
 impl Default for ForkRecoveryState {
     fn default() -> Self {
         Self {
             transaction_overrides: parking_lot::RwLock::new(HashMap::new()),
+            checkpoint_overrides: parking_lot::RwLock::new(HashMap::new()),
         }
     }
 }
@@ -922,8 +982,21 @@ impl ForkRecoveryState {
             transaction_overrides.insert(tx_digest, effects_digest);
         }
 
+        let mut checkpoint_overrides = HashMap::new();
+        for (seq_num, checkpoint_digest_str) in &config.checkpoint_overrides {
+            let checkpoint_digest =
+                CheckpointDigest::from_str(checkpoint_digest_str).map_err(|_| {
+                    SuiError::Unknown(format!(
+                        "Invalid checkpoint digest: {}",
+                        checkpoint_digest_str
+                    ))
+                })?;
+            checkpoint_overrides.insert(*seq_num, checkpoint_digest);
+        }
+
         Ok(Self {
             transaction_overrides: parking_lot::RwLock::new(transaction_overrides),
+            checkpoint_overrides: parking_lot::RwLock::new(checkpoint_overrides),
         })
     }
 
@@ -932,6 +1005,13 @@ impl ForkRecoveryState {
         tx_digest: &TransactionDigest,
     ) -> Option<TransactionEffectsDigest> {
         self.transaction_overrides.read().get(tx_digest).copied()
+    }
+
+    pub fn get_checkpoint_override(
+        &self,
+        seq_num: &CheckpointSequenceNumber,
+    ) -> Option<CheckpointDigest> {
+        self.checkpoint_overrides.read().get(seq_num).copied()
     }
 }
 
@@ -963,7 +1043,7 @@ pub struct AuthorityState {
     committee_store: Arc<CommitteeStore>,
 
     /// Schedules transaction execution.
-    execution_scheduler: Arc<ExecutionScheduler>,
+    execution_scheduler: Arc<ExecutionSchedulerWrapper>,
 
     /// Shuts down the execution task. Used only in testing.
     #[allow(unused)]
@@ -1245,7 +1325,7 @@ impl AuthorityState {
     /// But if the transaction has been finalized, the signing will fail.
     /// TODO(mysticeti-fastpath): Assess whether we want to optimize the case when the transaction
     /// has already been finalized executed.
-    #[instrument(level = "trace", skip_all, fields(tx_digest = ?transaction.digest()))]
+    #[instrument(level = "trace", skip_all)]
     pub(crate) fn handle_vote_transaction(
         &self,
         epoch_store: &Arc<AuthorityPerEpochStore>,
@@ -1510,6 +1590,10 @@ impl AuthorityState {
         let _metrics_guard = self.metrics.await_transaction_latency.start_timer();
         debug!("await_transaction");
 
+        // TODO(fastpath): Add handling for transactions rejected by Mysticeti fast path.
+        // TODO(fastpath): Can an MFP transaction be reverted after epoch ends? If so,
+        // same warning as above applies: We must be careful not to return a result
+        // here after the epoch ends.
         epoch_store
             .within_alive_epoch(
                 self.notify_read_effects("AuthorityState::await_transaction_effects", digest),
@@ -1914,6 +1998,7 @@ impl AuthorityState {
         let _metrics_guard = self.metrics.commit_certificate_latency.start_timer();
 
         let tx_digest = certificate.digest();
+        let output_keys = transaction_outputs.output_keys.clone();
 
         // The insertion to epoch_store is not atomic with the insertion to the perpetual store. This is OK because
         // we insert to the epoch store first. And during lookups we always look up in the perpetual store first.
@@ -2439,7 +2524,7 @@ impl AuthorityState {
         let (kind, signer, _) = transaction.execution_parts();
 
         let silent = true;
-        let executor = sui_execution::executor(protocol_config, silent)
+        let executor = sui_execution::executor(protocol_config, silent, None)
             .expect("Creating an executor should not fail here");
 
         // === 修改部分开始 ===
@@ -2640,7 +2725,7 @@ impl AuthorityState {
         let (kind, signer, _) = transaction.execution_parts();
 
         let silent = true;
-        let executor = sui_execution::executor(protocol_config, silent)
+        let executor = sui_execution::executor(protocol_config, silent, None)
             .expect("Creating an executor should not fail here");
 
         // === 修改部分开始 ===
@@ -2855,6 +2940,7 @@ impl AuthorityState {
         let executor = sui_execution::executor(
             protocol_config,
             true, // silent
+            None,
         )
         .expect("Creating an executor should not fail here");
 
@@ -3046,7 +3132,7 @@ impl AuthorityState {
             }
         };
 
-        let executor = sui_execution::executor(protocol_config, /* silent */ true)
+        let executor = sui_execution::executor(protocol_config, /* silent */ true, None)
             .expect("Creating an executor should not fail here");
         let gas_data = transaction.gas_data().clone();
         let intent_msg = IntentMessage::new(
@@ -3197,28 +3283,20 @@ impl AuthorityState {
             let cur_stake = (**committee).weight(&self.name);
             if cur_stake > 0 {
                 TOTAL_FAILING_STAKE.with_borrow_mut(|total_stake| {
-                    let already_forked = forked_validators
-                        .lock()
-                        .ok()
-                        .map(|set| set.contains(&self.name))
-                        .unwrap_or(false);
+                    let should_fork = if full_halt {
+                        // For partial fork, fork enough nodes to cause true split brain
+                        *total_stake <= committee.validity_threshold()
+                    } else {
+                        // For partial fork, only fork up to but not including validity threshold
+                        *total_stake + cur_stake < committee.validity_threshold()
+                    };
 
-                    if !already_forked {
-                        let should_fork = if full_halt {
-                            // For full halt, fork enough nodes to reach validity threshold
-                            *total_stake <= committee.validity_threshold()
-                        } else {
-                            // For partial fork, stay strictly below validity threshold
-                            *total_stake + cur_stake < committee.validity_threshold()
-                        };
+                    if should_fork {
+                        *total_stake += cur_stake;
 
-                        if should_fork {
-                            *total_stake += cur_stake;
-
-                            if let Ok(mut external_set) = forked_validators.lock() {
-                                external_set.insert(self.name);
-                                info!("forked_validators: {:?}", external_set);
-                            }
+                        if let Ok(mut external_set) = forked_validators.lock() {
+                            external_set.insert(self.name);
+                            info!("forked_validators: {:?}", external_set);
                         }
                     }
 
@@ -3246,6 +3324,7 @@ impl AuthorityState {
                                         ?original_effects_digest,
                                         "Captured forked effects digest for transaction"
                                     );
+                                    info!("cp_exec failing tx");
                                     effects.gas_cost_summary_mut_for_testing().computation_cost +=
                                         1;
                                 }
@@ -3776,7 +3855,7 @@ impl AuthorityState {
 
         let metrics = Arc::new(AuthorityMetrics::new(prometheus_registry));
         let (tx_ready_certificates, rx_ready_certificates) = unbounded_channel();
-        let execution_scheduler = Arc::new(ExecutionScheduler::new(
+        let execution_scheduler = Arc::new(ExecutionSchedulerWrapper::new(
             execution_cache_trait_pointers.object_cache_reader.clone(),
             execution_cache_trait_pointers.child_object_resolver.clone(),
             execution_cache_trait_pointers
@@ -3784,6 +3863,7 @@ impl AuthorityState {
                 .clone(),
             tx_ready_certificates,
             &epoch_store,
+            !epoch_store.committee().authority_exists(&name), /* is_fullnode */
             metrics.clone(),
         ));
         let (tx_execution_shutdown, rx_execution_shutdown) = oneshot::channel();
@@ -3945,7 +4025,7 @@ impl AuthorityState {
         .await
     }
 
-    pub fn execution_scheduler(&self) -> &Arc<ExecutionScheduler> {
+    pub fn execution_scheduler(&self) -> &Arc<ExecutionSchedulerWrapper> {
         &self.execution_scheduler
     }
 
@@ -4062,20 +4142,10 @@ impl AuthorityState {
         // Safe to being reconfiguration now. No transactions are being executed,
         // and no epoch-specific tasks are running.
 
-        {
-            let state = cur_epoch_store.get_reconfig_state_write_lock_guard();
-            if state.should_accept_user_certs() {
-                // Need to change this so that consensus adapter do not accept certificates from user.
-                // This can happen if our local validator did not initiate epoch change locally,
-                // but 2f+1 nodes already concluded the epoch.
-                //
-                // This lock is essentially a barrier for
-                // `epoch_store.pending_consensus_certificates` table we are reading on the line after this block
-                cur_epoch_store.close_user_certs(state);
-            }
-            // lock is dropped here
-        }
-
+        // TODO: revert_uncommitted_epoch_transactions will soon be unnecessary -
+        // clear_state_end_of_epoch() can simply drop all uncommitted transactions
+        self.revert_uncommitted_epoch_transactions(cur_epoch_store)
+            .await?;
         self.get_reconfig_api()
             .clear_state_end_of_epoch(&execution_lock);
         self.check_system_consistency(cur_epoch_store, state_hasher, expensive_safety_check_config);
@@ -4122,6 +4192,12 @@ impl AuthorityState {
             )
             .await?;
         assert_eq!(new_epoch_store.epoch(), new_epoch);
+        match self.execution_scheduler.as_ref() {
+            ExecutionSchedulerWrapper::ExecutionScheduler(_) => {}
+            ExecutionSchedulerWrapper::TransactionManager(manager) => {
+                manager.reconfigure(new_epoch);
+            }
+        }
         *execution_lock = new_epoch;
         // drop execution_lock after epoch store was updated
         // see also assert in AuthorityState::process_certificate
@@ -4155,6 +4231,12 @@ impl AuthorityState {
                 .unwrap_or_default(),
         );
         let new_epoch = new_epoch_store.epoch();
+        match self.execution_scheduler.as_ref() {
+            ExecutionSchedulerWrapper::ExecutionScheduler(_) => {}
+            ExecutionSchedulerWrapper::TransactionManager(manager) => {
+                manager.reconfigure(new_epoch);
+            }
+        }
         self.epoch_store.store(new_epoch_store);
         epoch_store.epoch_terminated().await;
         *execution_lock = new_epoch;
@@ -4183,6 +4265,10 @@ impl AuthorityState {
             "Performing sui conservation consistency check for epoch {}",
             cur_epoch_store.epoch()
         );
+
+        if cfg!(debug_assertions) {
+            cur_epoch_store.check_all_executed_transactions_in_checkpoint();
+        }
 
         if let Err(err) = self
             .get_reconfig_api()
@@ -6138,6 +6224,45 @@ impl AuthorityState {
         Ok((system_obj, effects))
     }
 
+    /// This function is called at the very end of the epoch.
+    /// This step is required before updating new epoch in the db and calling reopen_epoch_db.
+    #[instrument(level = "error", skip_all)]
+    async fn revert_uncommitted_epoch_transactions(
+        &self,
+        epoch_store: &AuthorityPerEpochStore,
+    ) -> SuiResult {
+        {
+            let state = epoch_store.get_reconfig_state_write_lock_guard();
+            if state.should_accept_user_certs() {
+                // Need to change this so that consensus adapter do not accept certificates from user.
+                // This can happen if our local validator did not initiate epoch change locally,
+                // but 2f+1 nodes already concluded the epoch.
+                //
+                // This lock is essentially a barrier for
+                // `epoch_store.pending_consensus_certificates` table we are reading on the line after this block
+                epoch_store.close_user_certs(state);
+            }
+            // lock is dropped here
+        }
+        let pending_certificates = epoch_store.pending_consensus_certificates();
+        info!(
+            "Reverting {} locally executed transactions that was not included in the epoch: {:?}",
+            pending_certificates.len(),
+            pending_certificates,
+        );
+        for digest in pending_certificates {
+            if epoch_store.is_transaction_executed_in_checkpoint(&digest)? {
+                info!("Not reverting pending consensus transaction {:?} - it was included in checkpoint", digest);
+                continue;
+            }
+            info!("Reverting {:?} at the end of epoch", digest);
+            epoch_store.revert_executed_transaction(&digest)?;
+            self.get_reconfig_api().revert_state_update(&digest);
+        }
+        info!("All uncommitted local transactions reverted");
+        Ok(())
+    }
+
     #[instrument(level = "error", skip_all)]
     async fn reopen_epoch_db(
         &self,
@@ -6275,6 +6400,17 @@ impl RandomnessRoundReceiver {
         // Notify the scheduler that the transaction key now has a known digest
         if epoch_store.insert_tx_key(key, digest).is_err() {
             warn!("epoch ended while handling new randomness");
+        }
+
+        // TODO: delete this when transaction manager is deleted
+        match self.authority_state.execution_scheduler().as_ref() {
+            ExecutionSchedulerWrapper::ExecutionScheduler(_) => {}
+            ExecutionSchedulerWrapper::TransactionManager(manager) => {
+                // Notifies transaction manager about transaction and output objects committed.
+                // This provides necessary information to transaction manager to start executing
+                // additional ready transactions.
+                manager.notify_transaction_key(&epoch_store, key, digest);
+            }
         }
 
         let authority_state = self.authority_state.clone();
