@@ -59,7 +59,7 @@ use crate::{
     consensus_throughput_calculator::ConsensusThroughputCalculator,
     consensus_types::consensus_output_api::{parse_block_transactions, ConsensusCommitAPI},
     execution_cache::ObjectCacheRead,
-    execution_scheduler::{ExecutionScheduler, SchedulingSource},
+    execution_scheduler::{ExecutionSchedulerAPI, ExecutionSchedulerWrapper, SchedulingSource},
     scoring_decision::update_low_scoring_authorities,
 };
 
@@ -552,7 +552,7 @@ impl<C> ConsensusHandler<C> {
     pub(crate) fn new(
         epoch_store: Arc<AuthorityPerEpochStore>,
         checkpoint_service: Arc<C>,
-        execution_scheduler: Arc<ExecutionScheduler>,
+        execution_scheduler: Arc<ExecutionSchedulerWrapper>,
         consensus_adapter: Arc<ConsensusAdapter>,
         cache_reader: Arc<dyn ObjectCacheRead>,
         low_scoring_authorities: Arc<ArcSwap<HashMap<AuthorityName, u64>>>,
@@ -977,7 +977,7 @@ pub(crate) struct ExecutionSchedulerSender {
 
 impl ExecutionSchedulerSender {
     fn start(
-        execution_scheduler: Arc<ExecutionScheduler>,
+        execution_scheduler: Arc<ExecutionSchedulerWrapper>,
         epoch_store: Arc<AuthorityPerEpochStore>,
     ) -> Self {
         let (sender, recv) = monitored_mpsc::unbounded_channel("execution_scheduler_sender");
@@ -1002,7 +1002,7 @@ impl ExecutionSchedulerSender {
             AssignedTxAndVersions,
             SchedulingSource,
         )>,
-        execution_scheduler: Arc<ExecutionScheduler>,
+        execution_scheduler: Arc<ExecutionSchedulerWrapper>,
         epoch_store: Arc<AuthorityPerEpochStore>,
     ) {
         while let Some((transactions, assigned_versions, scheduling_source)) = recv.recv().await {

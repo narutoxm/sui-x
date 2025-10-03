@@ -57,6 +57,12 @@ pub struct PendingCertificate {
     // Stores stats about this transaction.
     pub stats: PendingCertificateStats,
     pub executing_guard: Option<ExecutingGuard>,
+
+    // The input object this certificate is waiting for to become available in order to be executed.
+    // This is only used by TransactionManager.
+    pub waiting_input_objects: BTreeSet<InputKey>,
+
+
 }
 
 #[derive(Debug)]

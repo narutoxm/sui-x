@@ -66,7 +66,9 @@ use tokio::time::timeout;
 use tonic::metadata::{Ascii, MetadataValue};
 use tracing::{debug, error, error_span, info, instrument, Instrument};
 
-use crate::consensus_adapter::ConnectionMonitorStatusForTests;
+use crate::{
+    consensus_adapter::ConnectionMonitorStatusForTests, execution_scheduler::ExecutionSchedulerAPI,
+};
 use crate::{
     authority::{
         authority_per_epoch_store::AuthorityPerEpochStore,

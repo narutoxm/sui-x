@@ -334,6 +334,7 @@ pub struct AuthorityMetrics {
     db_checkpoint_latency: Histogram,
 
     // TODO: Rename these metrics.
+    pub(crate) transaction_manager_num_ready: IntGauge,
     pub(crate) transaction_manager_num_missing_objects: IntGauge,
     pub(crate) transaction_manager_object_cache_size: IntGauge,
     pub(crate) transaction_manager_object_cache_hits: IntCounter,
@@ -601,6 +602,18 @@ impl AuthorityMetrics {
                 registry,
             )
             .unwrap(),
+            transaction_manager_num_missing_objects: register_int_gauge_with_registry!(
+                "transaction_manager_num_missing_objects",
+                "Current number of missing objects in TransactionManager",
+                registry,
+            )
+            .unwrap(),
+            transaction_manager_object_cache_size: register_int_gauge_with_registry!(
+                "transaction_manager_object_cache_size",
+                "Current size of object-availability cache in TransactionManager",
+                registry,
+            )
+            .unwrap(),
             transaction_manager_num_pending_certificates: register_int_gauge_with_registry!(
                 "transaction_manager_num_pending_certificates",
                 "Number of certificates pending in ExecutionScheduler, with at least 1 missing input object",
@@ -638,6 +651,12 @@ impl AuthorityMetrics {
             transaction_manager_package_cache_hits: register_int_counter_with_registry!(
                 "transaction_manager_package_cache_hits",
                 "Number of package-availability cache hits in TransactionManager",
+                registry,
+            )
+            .unwrap(),
+            transaction_manager_num_ready: register_int_gauge_with_registry!(
+                "transaction_manager_num_ready",
+                "Number of ready transactions in TransactionManager",
                 registry,
             )
             .unwrap(),
@@ -1017,7 +1036,7 @@ pub struct AuthorityState {
     committee_store: Arc<CommitteeStore>,
 
     /// Schedules transaction execution.
-    execution_scheduler: Arc<ExecutionScheduler>,
+    execution_scheduler: Arc<ExecutionSchedulerWrapper>,
 
     /// Shuts down the execution task. Used only in testing.
     #[allow(unused)]
@@ -3808,7 +3827,7 @@ impl AuthorityState {
 
         let metrics = Arc::new(AuthorityMetrics::new(prometheus_registry));
         let (tx_ready_certificates, rx_ready_certificates) = unbounded_channel();
-        let execution_scheduler = Arc::new(ExecutionScheduler::new(
+        let execution_scheduler = Arc::new(ExecutionSchedulerWrapper::new(
             execution_cache_trait_pointers.object_cache_reader.clone(),
             execution_cache_trait_pointers.child_object_resolver.clone(),
             execution_cache_trait_pointers
@@ -3816,6 +3835,7 @@ impl AuthorityState {
                 .clone(),
             tx_ready_certificates,
             &epoch_store,
+            !epoch_store.committee().authority_exists(&name), /* is_fullnode */
             metrics.clone(),
         ));
         let (tx_execution_shutdown, rx_execution_shutdown) = oneshot::channel();
@@ -3977,7 +3997,7 @@ impl AuthorityState {
         .await
     }
 
-    pub fn execution_scheduler(&self) -> &Arc<ExecutionScheduler> {
+    pub fn execution_scheduler(&self) -> &Arc<ExecutionSchedulerWrapper> {
         &self.execution_scheduler
     }
 
