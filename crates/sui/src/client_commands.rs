@@ -26,7 +26,6 @@ use fastcrypto::{
     traits::ToFromBytes,
 };
 use reqwest::StatusCode;
-use sui_replay_2 as SR2;
 
 use move_binary_format::CompiledModule;
 use move_bytecode_verifier_meter::Scope;
@@ -108,7 +107,8 @@ use sui_keys::key_derive;
 use sui_types::digests::ChainIdentifier;
 use tracing::{debug, info};
 
-static USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"),);
+pub(crate) static USER_AGENT: &str =
+    concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"),);
 
 /// Only to be used within CLI
 pub const GAS_SAFE_OVERHEAD: u64 = 1000;
@@ -640,61 +640,17 @@ pub enum SuiClientCommands {
     #[clap(name = "remove-address")]
     RemoveAddress { alias_or_address: String },
 
-    /// Replay a given transaction to view transaction effects. Set environment variable MOVE_VM_STEP=1 to debug.
+    /// Replay a given transaction to view transaction effects (deprecated; use `sui replay` instead)
     #[clap(name = "replay-transaction")]
-    ReplayTransaction {
-        /// The digest of the transaction to replay
-        #[arg(long, short)]
-        tx_digest: String,
+    ReplayTransaction {},
 
-        /// Log extra gas-related information
-        #[arg(long)]
-        gas_info: bool,
-
-        /// Log information about each programmable transaction command
-        #[arg(long)]
-        ptb_info: bool,
-
-        /// The output directory for the replay artifacts. Defaults `<cur_dir>/.replay/<digest>`.
-        #[arg(long)]
-        output_dir: Option<PathBuf>,
-
-        /// Whether to trace the transaction execution. Generated traces will be saved in the output
-        /// directory (or `<cur_dir>/.replay/<digest>` if none provided).
-        #[arg(long = "trace", default_value = "false")]
-        trace: bool,
-
-        /// Whether existing artifacts that were generated from a previous replay of the transaction
-        /// should be overwritten or an error raised if they already exist.
-        #[arg(long, default_value = "false")]
-        overwrite_existing: bool,
-    },
-
-    /// Replay transactions listed in a file.
+    /// Replay transactions listed in a file (deprecated; use `sui replay` instead)
     #[clap(name = "replay-batch")]
-    ReplayBatch {
-        /// The path to the file of transaction digests to replay, with one digest per line
-        #[arg(long, short)]
-        path: PathBuf,
+    ReplayBatch {},
 
-        /// If an error is encountered during a transaction, this specifies whether to terminate or continue
-        #[arg(long, short)]
-        terminate_early: bool,
-
-        /// Whether to trace the transaction execution. Generated traces will be saved in the output
-        /// directory (or `<cur_dir>/.replay/<digest>` if none provided).
-        #[arg(long = "trace", default_value = "false")]
-        trace: bool,
-
-        /// The output directory for the replay artifacts. Defaults `<cur_dir>/.replay/<digest>`.
-        #[arg(long, short)]
-        output_dir: Option<PathBuf>,
-
-        /// Whether existing artifacts that were generated from a previous replay of the transaction
-        /// should be overwritten or an error raised if they already exist.
-        #[arg(long, default_value = "false")]
-        overwrite_existing: bool,
-    },
+    /// Replay all transactions in a range of checkpoints (deprecated; use `sui replay` instead)
+    #[clap(name = "replay-checkpoint")]
+    ReplayCheckpoints {},
 }
 
 /// Arguments related to providing coins for gas payment
@@ -776,71 +732,16 @@ impl SuiClientCommands {
         context: &mut WalletContext,
     ) -> Result<SuiClientCommandResult, anyhow::Error> {
         let ret = match self {
-            SuiClientCommands::ReplayTransaction {
-                tx_digest,
-                gas_info: _,
-                ptb_info: _,
-                output_dir,
-                trace,
-                overwrite_existing,
-            } => {
-                let node = get_replay_node(context).await?;
-                let cmd2 = SR2::ReplayConfig {
-                    digest: Some(tx_digest.clone()),
-                    digests_path: None,
-                    node,
-                    trace,
-                    terminate_early: false,
-                    output_dir,
-                    show_effects: false,
-                    overwrite_existing,
-                    verbose: false,
-                    store_mode: SR2::StoreMode::GqlOnly,
-                };
-
-                let artifact_path = SR2::handle_replay_config(&cmd2, USER_AGENT).await?;
-
-                // show effects and gas
-                SR2::print_effects_or_fork(
-                    &tx_digest,
-                    &artifact_path,
-                    true,
-                    &mut std::io::stdout(),
-                )?;
-
-                // this will be displayed via trace info, so no output is needed here
+            SuiClientCommands::ReplayTransaction {} => {
+                eprintln!("This command is deprecated. Use `sui replay` instead.");
                 SuiClientCommandResult::NoOutput
             }
-            SuiClientCommands::ReplayBatch {
-                path,
-                terminate_early,
-                trace,
-                output_dir,
-                overwrite_existing,
-            } => {
-                let node = get_replay_node(context).await?;
-                let cmd2 = SR2::ReplayConfig {
-                    digest: None,
-                    digests_path: Some(path),
-                    node,
-                    trace,
-                    terminate_early,
-                    output_dir,
-                    show_effects: false,
-                    overwrite_existing,
-                    verbose: false,
-                    store_mode: SR2::StoreMode::GqlOnly,
-                };
-
-                let artifact_path = SR2::handle_replay_config(&cmd2, USER_AGENT).await?;
-
-                println!(
-                    "Replayed transactions from {}. Artifacts stored under {}",
-                    cmd2.digests_path.as_ref().unwrap().display(),
-                    artifact_path.display()
-                );
-
-                // this will be displayed via trace info, so no output is needed here
+            SuiClientCommands::ReplayBatch {} => {
+                eprintln!("This command is deprecated. Use `sui replay` instead.");
+                SuiClientCommandResult::NoOutput
+            }
+            SuiClientCommands::ReplayCheckpoints {} => {
+                eprintln!("This command is deprecated. Use `sui replay` instead.");
                 SuiClientCommandResult::NoOutput
             }
             SuiClientCommands::Addresses { sort_by_alias } => {
@@ -3621,20 +3522,4 @@ pub(crate) async fn pkg_tree_shake(
     });
 
     Ok(())
-}
-
-async fn get_replay_node(context: &mut WalletContext) -> Result<SR2::Node, anyhow::Error> {
-    let chain_id = context
-        .get_client()
-        .await?
-        .read_api()
-        .get_chain_identifier()
-        .await?;
-    let chain_id = ChainIdentifier::from_chain_short_id(&chain_id)
-        .ok_or_else(|| anyhow::anyhow!("Unsupported chain identifier for replay -- only testnet and mainnet are supported currently: {chain_id}"))?;
-    Ok(match chain_id.chain() {
-        Chain::Mainnet => SR2::Node::Mainnet,
-        Chain::Testnet => SR2::Node::Testnet,
-        Chain::Unknown => bail!("Unsupported chain identifier for replay -- only testnet and mainnet are supported currently"),
-    })
 }

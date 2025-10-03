@@ -9,8 +9,6 @@ pub mod authority;
 pub mod authority_aggregator;
 pub mod authority_client;
 pub mod authority_server;
-pub mod cache_update_handler;
-mod tx_handler;
 pub mod checkpoints;
 pub mod congestion_tracker;
 pub mod consensus_adapter;
@@ -32,13 +30,14 @@ pub mod mock_consensus;
 pub mod module_cache_metrics;
 pub mod mysticeti_adapter;
 pub mod overload_monitor;
-pub mod override_cache;
 mod par_index_live_object_set;
 pub(crate) mod post_consensus_tx_reorder;
 pub mod quorum_driver;
 pub mod rpc_index;
+pub mod runtime;
 pub mod safe_client;
 mod scoring_decision;
+pub mod signature_verifier;
 mod stake_aggregator;
 mod status_aggregator;
 pub mod storage;
@@ -49,7 +48,8 @@ pub mod traffic_controller;
 pub mod transaction_driver;
 mod transaction_input_loader;
 pub mod transaction_orchestrator;
-pub mod transaction_outputs;
+mod transaction_outputs;
+mod transaction_signing_filter;
 pub mod validator_client_monitor;
 pub mod validator_tx_finalizer;
 pub mod verify_indexes;
@@ -86,8 +86,3 @@ mod type_param_tests;
 #[cfg(test)]
 #[path = "unit_tests/unit_test_utils.rs"]
 mod unit_test_utils;
-
-pub mod signature_verifier;
-
-pub mod runtime;
-mod transaction_signing_filter;

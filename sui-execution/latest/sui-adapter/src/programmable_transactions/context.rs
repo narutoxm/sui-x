@@ -57,6 +57,7 @@ mod checked {
     use sui_protocol_config::ProtocolConfig;
     use sui_types::{
         accumulator_event::AccumulatorEvent,
+        accumulator_root::AccumulatorObjId,
         balance::Balance,
         base_types::{MoveObjectType, ObjectID, SuiAddress, TxContext},
         coin::Coin,
@@ -1547,7 +1548,10 @@ mod checked {
                         value,
                     };
 
-                    AccumulatorEvent::new(accum_event.accumulator_id, write)
+                    AccumulatorEvent::new(
+                        AccumulatorObjId::new_unchecked(accum_event.accumulator_id),
+                        write,
+                    )
                 }
             })
             .collect();
@@ -1837,7 +1841,7 @@ mod checked {
                 input_object_map,
                 obj_arg,
             )?,
-            CallArg::BalanceWithdraw(_) => {
+            CallArg::FundsWithdrawal(_) => {
                 // TODO(address-balances): Add support for balance withdraws.
                 InputValue::new_balance_withdraw()
             }

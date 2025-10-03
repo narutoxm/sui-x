@@ -7,12 +7,12 @@ use fastcrypto::traits::ToFromBytes;
 use futures::future::join_all;
 use futures::future::AbortHandle;
 use itertools::Itertools;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::fmt::Write;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc};
+use std::sync::Arc;
 use std::time::Duration;
 use std::{fs, io};
 use sui_config::{genesis::Genesis, NodeConfig};
@@ -24,7 +24,7 @@ use sui_protocol_config::Chain;
 use sui_sdk::SuiClient;
 use sui_sdk::SuiClientBuilder;
 use sui_storage::object_store::http::HttpDownloaderBuilder;
-use sui_storage::object_store::util::{copy_file_ext, format_size, DownloadStatus, Manifest};
+use sui_storage::object_store::util::Manifest;
 use sui_storage::object_store::util::PerEpochManifest;
 use sui_storage::object_store::util::MANIFEST_FILENAME;
 use sui_types::committee::QUORUM_THRESHOLD;
@@ -33,7 +33,7 @@ use sui_types::global_state_hash::GlobalStateHash;
 use sui_types::messages_grpc::LayoutGenerationOption;
 use sui_types::multiaddr::Multiaddr;
 use sui_types::{base_types::*, object::Owner};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
@@ -41,7 +41,7 @@ use anyhow::anyhow;
 use clap::ValueEnum;
 use eyre::ContextCompat;
 use fastcrypto::hash::MultisetHash;
-use futures::{stream, StreamExt, TryStreamExt};
+use futures::{StreamExt, TryStreamExt};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use prometheus::Registry;
 use serde::{Deserialize, Serialize};
@@ -63,8 +63,9 @@ use sui_types::messages_grpc::{
 };
 
 use crate::formal_snapshot_util::{read_summaries_for_list_no_verify, FormalSnapshotWorker};
+use sui_core::authority::authority_store_pruner::PrunerWatermarks;
 use sui_types::storage::ReadStore;
-use tracing::{error, info};
+use tracing::info;
 
 pub mod commands;
 #[cfg(not(tidehunter))]
@@ -826,6 +827,7 @@ pub async fn download_formal_snapshot(
     network: Chain,
     verify: SnapshotVerifyMode,
     all_checkpoints: bool,
+    max_retries: usize,
 ) -> Result<(), anyhow::Error> {
     let m = MultiProgress::new();
     m.println(format!(
@@ -836,7 +838,11 @@ pub async fn download_formal_snapshot(
     if path.exists() {
         fs::remove_dir_all(path.clone())?;
     }
-    let perpetual_db = Arc::new(AuthorityPerpetualTables::open(&path.join("store"), None));
+    let perpetual_db = Arc::new(AuthorityPerpetualTables::open(
+        &path.join("store"),
+        None,
+        None,
+    ));
     let genesis = Genesis::load(genesis).unwrap();
     let genesis_committee = genesis.committee()?;
     let committee_store = Arc::new(CommitteeStore::new(
@@ -844,7 +850,10 @@ pub async fn download_formal_snapshot(
         &genesis_committee,
         None,
     ));
-    let checkpoint_store = CheckpointStore::new(&path.join("checkpoints"));
+    let checkpoint_store = CheckpointStore::new(
+        &path.join("checkpoints"),
+        Arc::new(PrunerWatermarks::default()),
+    );
 
     let summaries_handle = start_summary_sync(
         perpetual_db.clone(),
@@ -884,6 +893,7 @@ pub async fn download_formal_snapshot(
             NonZeroUsize::new(num_parallel_downloads).unwrap(),
             m_clone,
             false, // skip_reset_local_store
+            max_retries,
         )
         .await
         .unwrap_or_else(|err| panic!("Failed to create reader: {}", err));
@@ -1002,6 +1012,7 @@ pub async fn download_db_snapshot(
     snapshot_store_config: ObjectStoreConfig,
     skip_indexes: bool,
     num_parallel_downloads: usize,
+    max_retries: usize,
 ) -> Result<(), anyhow::Error> {
     let remote_store = if snapshot_store_config.no_sign_request {
         snapshot_store_config.make_http()?
@@ -1009,7 +1020,7 @@ pub async fn download_db_snapshot(
         snapshot_store_config.make().map(Arc::new)?
     };
 
-    // 加载MANIFEST文件
+    // We rely on the top level MANIFEST file which contains all valid epochs
     let manifest_contents = remote_store.get_bytes(&get_path(MANIFEST_FILENAME)).await?;
     let root_manifest: Manifest = serde_json::from_slice(&manifest_contents)
         .map_err(|err| anyhow!("Error parsing MANIFEST from bytes: {}", err))?;
@@ -1023,8 +1034,8 @@ pub async fn download_db_snapshot(
 
     let epoch_path = format!("epoch_{}", epoch);
     let epoch_dir = get_path(&epoch_path);
-    let manifest_file = epoch_dir.child(MANIFEST_FILENAME);
 
+    let manifest_file = epoch_dir.child(MANIFEST_FILENAME);
     let epoch_manifest_contents =
         String::from_utf8(remote_store.get_bytes(&manifest_file).await?.to_vec())
             .map_err(|err| anyhow!("Error parsing {}/MANIFEST from bytes: {}", epoch_path, err))?;
@@ -1032,261 +1043,105 @@ pub async fn download_db_snapshot(
     let epoch_manifest =
         PerEpochManifest::deserialize_from_newline_delimited(&epoch_manifest_contents);
 
-    let mut all_files: Vec<String> = vec![];
-    all_files.extend(epoch_manifest.filter_by_prefix("store/perpetual").lines);
-    all_files.extend(epoch_manifest.filter_by_prefix("epochs").lines);
-    all_files.extend(epoch_manifest.filter_by_prefix("checkpoints").lines);
-
+    let mut files: Vec<String> = vec![];
+    files.extend(epoch_manifest.filter_by_prefix("store/perpetual").lines);
+    files.extend(epoch_manifest.filter_by_prefix("epochs").lines);
+    files.extend(epoch_manifest.filter_by_prefix("checkpoints").lines);
     if !skip_indexes {
-        all_files.extend(epoch_manifest.filter_by_prefix("indexes").lines)
+        files.extend(epoch_manifest.filter_by_prefix("indexes").lines)
     }
-
-    // 创建本地存储配置
     let local_store = ObjectStoreConfig {
         object_store: Some(ObjectStoreType::File),
         directory: Some(path.to_path_buf()),
         ..Default::default()
     }
-        .make()?;
-
-    // 创建下载状态跟踪结构
-    let active_downloads = Arc::new(Mutex::new(HashMap::<String, DownloadStatus>::new()));
-    let total_bytes_downloaded = Arc::new(AtomicU64::new(0));
-    let start_time = Instant::now();
-
-    // 检查已下载文件并创建需要下载的文件列表
-    let mut files_to_download: Vec<String> = Vec::new();
-    let mut already_downloaded = 0;
-
-    // 创建目录结构
-    let download_dir = path.join(&epoch_path);
-    if !download_dir.exists() {
-        fs::create_dir_all(&download_dir)?;
-    }
-
-    // 检查哪些文件已下载且完整
-    info!("Checking for existing files...");
-    for file in &all_files {
-        let local_file_path = path.join(format!("{}/{}", epoch_path, file));
-
-        if local_file_path.exists() {
-            let file_metadata = match fs::metadata(&local_file_path) {
-                Ok(meta) => meta,
-                Err(_) => {
-                    // 无法读取元数据，添加到下载列表
-                    files_to_download.push(file.clone());
-                    continue;
-                }
-            };
-
-            // 如果文件存在且大小大于0，我们认为它已经下载完成
-            if file_metadata.len() > 0 {
-                already_downloaded += 1;
-                continue;
-            }
-        }
-
-        // 文件不存在或为空，添加到下载列表
-        files_to_download.push(file.clone());
-    }
-
-    info!("Found {} already downloaded files, {} files need to be downloaded",
-          already_downloaded, files_to_download.len());
-
-    // 如果所有文件都已下载，直接返回
-    if files_to_download.is_empty() {
-        info!("All files already downloaded. Snapshot download complete!");
-        return Ok(());
-    }
-
-    // 设置进度显示
+    .make()?;
     let m = MultiProgress::new();
-    let overall_progress = m.add(
-        ProgressBar::new(files_to_download.len() as u64).with_style(
-            ProgressStyle::with_template(
-                "[{elapsed_precise}] {wide_bar} {pos}/{len} files ({percent}%) - {msg}"
-            ).unwrap(),
-        )
-    );
-
-    let stats_bar = m.add(
-        ProgressBar::new(100).with_style(
-            ProgressStyle::with_template("{msg}").unwrap()
-        )
-    );
-    stats_bar.set_message("Initializing download...");
-
-    // 为状态更新任务克隆进度条
-    let stats_progress = overall_progress.clone();
-
-    // 启动统计信息更新任务
-    let stats_handle = {
-        let stats_bar = stats_bar.clone();
-        let total_bytes = total_bytes_downloaded.clone();
-        let active_downloads = active_downloads.clone();
-
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(2));
-            loop {
-                interval.tick().await;
-
-                let elapsed = start_time.elapsed().as_secs_f64();
-                let current_bytes = total_bytes.load(Ordering::Relaxed);
-                let active_count = active_downloads.lock().await.len();
-
-                if elapsed > 0.0 {
-                    let bytes_per_second = current_bytes as f64 / elapsed;
-
-                    stats_bar.set_message(format!(
-                        "Speed: {}/s | Total: {} | Active downloads: {}",
-                        format_size(bytes_per_second as u64),
-                        format_size(current_bytes),
-                        active_count
-                    ));
-
-                    // 每10秒输出详细的活跃下载状态
-                    if (elapsed as u64) % 10 == 0 && active_count > 0 {
-                        let downloads = active_downloads.lock().await;
-                        info!("--- Active downloads ({}) ---", downloads.len());
-                        for (path, status) in downloads.iter() {
-                            let duration = status.start_time.elapsed().as_secs();
-                            let rate = if duration > 0 {
-                                status.bytes_downloaded as f64 / duration as f64
-                            } else {
-                                0.0
-                            };
-
-                            info!("  - {} (Running for {}s, Size: {}, Speed: {}/s)",
-                                path,
-                                duration,
-                                format_size(status.bytes_downloaded),
-                                format_size(rate as u64)
-                            );
-                        }
-                        info!("-------------------------");
-                    }
-                }
-
-                // 如果进度条已完成，退出循环
-                if stats_progress.position() >= stats_progress.length().unwrap_or(0) {
-                    break;
-                }
-            }
-
-            Ok::<(), anyhow::Error>(())
-        })
-    };
-
-    // 开始下载文件
-    overall_progress.set_message("Starting download...");
-
-    // 为下载任务克隆进度条
-    let download_progress = overall_progress.clone();
-
+    let path = path.to_path_buf();
     let snapshot_handle = tokio::spawn(async move {
+        let progress_bar = m.add(
+            ProgressBar::new(files.len() as u64).with_style(
+                ProgressStyle::with_template(
+                    "[{elapsed_precise}] {wide_bar} {pos} out of {len} files done ({msg})",
+                )
+                .unwrap(),
+            ),
+        );
+        let cloned_progress_bar = progress_bar.clone();
         let file_counter = Arc::new(AtomicUsize::new(0));
-        let owned_files_to_download: Vec<String> = files_to_download.clone();
-        let results = stream::iter(owned_files_to_download)
+        futures::stream::iter(files.iter())
             .map(|file| {
                 let local_store = local_store.clone();
                 let remote_store = remote_store.clone();
-                let counter = file_counter.clone();
-                let active_downloads = active_downloads.clone();
-                let total_bytes = total_bytes_downloaded.clone();
-                let progress_bar = download_progress.clone();
-                let file_string = file.to_string();  // 转换为拥有所有权的String
-
+                let counter_cloned = file_counter.clone();
                 async move {
-                    counter.fetch_add(1, Ordering::Relaxed);
+                    counter_cloned.fetch_add(1, Ordering::Relaxed);
+                    let file_path = get_path(format!("epoch_{}/{}", epoch, file).as_str());
 
-                    let src_path = get_path(format!("epoch_{}/{}", epoch, file_string).as_str());
-                    let dest_path = src_path.clone();
-
-                    let result = copy_file_ext(
-                        &src_path,
-                        &dest_path,
-                        &remote_store,
-                        &local_store,
-                        active_downloads.clone(),
-                        total_bytes.clone()
-                    ).await;
-
-                    // 更新进度条
-                    progress_bar.inc(1);
-                    progress_bar.set_message(format!(
-                        "Downloading: {}/{} completed",
-                        progress_bar.position(),
-                        progress_bar.length().unwrap_or(0)
-                    ));
-
-                    // 如果下载失败，记录错误但继续其他文件
-                    if let Err(e) = &result {
-                        error!("Failed to download file {}: {}", file_string, e);
+                    let mut attempts = 0;
+                    let max_attempts = max_retries + 1;
+                    loop {
+                        attempts += 1;
+                        match copy_file(&file_path, &file_path, &remote_store, &local_store).await {
+                            Ok(()) => break,
+                            Err(e) if attempts >= max_attempts => {
+                                return Err(anyhow::anyhow!(
+                                    "Failed to download {} after {} attempts: {}",
+                                    file_path,
+                                    attempts,
+                                    e
+                                ));
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Failed to download {} (attempt {}/{}): {}, retrying in {}ms",
+                                    file_path,
+                                    attempts,
+                                    max_attempts,
+                                    e,
+                                    1000 * attempts
+                                );
+                                tokio::time::sleep(Duration::from_millis(1000 * attempts as u64))
+                                    .await;
+                            }
+                        }
                     }
 
-                    counter.fetch_sub(1, Ordering::Relaxed);
-                    result
+                    Ok::<::object_store::path::Path, anyhow::Error>(file_path.clone())
                 }
             })
+            .boxed()
             .buffer_unordered(num_parallel_downloads)
-            .collect::<Vec<Result<(), anyhow::Error>>>()
-            .await;
-
-        // 检查是否有错误
-        let errors: Vec<_> = results.into_iter()
-            .filter_map(|r| if let Err(e) = r { Some(e) } else { None })
-            .collect();
-
-        if !errors.is_empty() {
-            error!("{} files failed to download", errors.len());
-            for (i, err) in errors.iter().enumerate().take(5) {
-                error!("Error {}: {}", i + 1, err);
-            }
-            if errors.len() > 5 {
-                error!("... and {} more errors", errors.len() - 5);
-            }
-
-            Err(anyhow!("{} files failed to download", errors.len()))
-        } else {
-            download_progress.finish_with_message("All files downloaded successfully!");
-            Ok(())
-        }
+            .try_for_each(|path| {
+                file_counter.fetch_sub(1, Ordering::Relaxed);
+                cloned_progress_bar.inc(1);
+                cloned_progress_bar.set_message(format!(
+                    "Downloading file: {}, #downloads_in_progress: {}",
+                    path,
+                    file_counter.load(Ordering::Relaxed)
+                ));
+                futures::future::ready(Ok(()))
+            })
+            .await?;
+        progress_bar.finish_with_message("Snapshot file download is complete");
+        Ok::<(), anyhow::Error>(())
     });
 
-    // 等待下载完成
-    let tasks: Vec<_> = vec![Box::pin(snapshot_handle), Box::pin(stats_handle)];
+    let tasks: Vec<_> = vec![Box::pin(snapshot_handle)];
+    join_all(tasks)
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .for_each(|result| result.expect("Task failed"));
 
-    // 收集所有任务结果
-    let results = join_all(tasks).await;
-
-    // 检查主下载任务是否成功
-    if let Some(result) = results.get(0) {
-        match result {
-            Ok(Ok(())) => {
-                // 下载成功，继续处理
-            },
-            Ok(Err(e)) => {
-                // 任务返回错误
-                return Err(anyhow!("Download task failed: {}", e));
-            },
-            Err(e) => {
-                // 任务自身失败（例如被取消）
-                return Err(anyhow!("Download task panicked: {}", e));
-            }
-        }
-    }
-
-    // 完成后清理临时目录
     let store_dir = path.join("store");
     if store_dir.exists() {
         fs::remove_dir_all(&store_dir)?;
     }
-
     let epochs_dir = path.join("epochs");
     if epochs_dir.exists() {
         fs::remove_dir_all(&epochs_dir)?;
     }
-
-    info!("Snapshot download completed successfully!");
     Ok(())
 }
