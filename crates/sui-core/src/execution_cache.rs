@@ -350,6 +350,18 @@ pub trait ObjectCacheRead: Send + Sync {
         epoch_id: EpochId,
     ) -> Option<(SequenceNumber, MarkerValue)>;
 
+    /// If the shared object was deleted, return deletion info for the current live version
+    fn get_last_shared_object_deletion_info(
+        &self,
+        object_id: &ObjectID,
+        epoch_id: EpochId,
+    ) -> Option<(SequenceNumber, TransactionDigest)> {
+        match self.get_latest_marker(FullObjectID::Fastpath(*object_id), epoch_id) {
+            Some((version, MarkerValue::ConsensusStreamEnded(digest))) => Some((version, digest)),
+            _ => None,
+        }
+    }
+
     /// If the given consensus object stream was ended, return related
     /// version and transaction digest.
     fn get_last_consensus_stream_end_info(
